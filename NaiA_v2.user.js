@@ -4,8 +4,8 @@
 // @version      1.0.14
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
-// @downloadURL  https://raw.githubusercontent.com/Dflashh/Nai/main/Archive/NaiA.user.js
-// @updateURL    https://raw.githubusercontent.com/Dflashh/Nai/main/Archive/NaiA.user.js
+// @downloadURL  https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
+// @updateURL    https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
 // @match        https://novelai.net/*
 // @match        https://*.notion.site/*
 // @match        https://notion.site/*
