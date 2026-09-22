@@ -1,7 +1,7 @@
     // ==UserScript==
 // @name         NAI Archive
 // @namespace    https://github.com/Dflashh/
-// @version      1.0.14
+// @version      1.0.15
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
 // @downloadURL  https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
@@ -32,7 +32,7 @@
     'use strict';
 
     const APP_NAME = 'NAI Archive';
-    const APP_VERSION = '1.0.14';
+    const APP_VERSION = '1.0.15';
     const BUTTON_ID = 'nai-concept-loader-button';
     const MODAL_ID = 'nai-concept-loader-modal';
     const SETTINGS_KEY = 'naiConceptLoader.settings';
@@ -19271,6 +19271,20 @@ ${pagePayload}
         const model = String(payload?.model || '');
         if (!/nai-diffusion-4-5/i.test(model)) return false;
         if (!payload.parameters || typeof payload.parameters !== 'object') payload.parameters = {};
+
+        // If NovelAI is visibly holding this Precise Reference but its own
+        // outgoing request has the reference disabled, respect that state.
+        // Keep Archive's saved active reference intact so re-enabling it still works.
+        const nativePanel = naiNotionFindNativeReferencePanel();
+        if (nativePanel) {
+            const p = payload.parameters;
+            const nativeRequestHasReference =
+                (Array.isArray(p.director_reference_descriptions) && p.director_reference_descriptions.length > 0) ||
+                (Array.isArray(p.director_reference_information_extracted) && p.director_reference_information_extracted.some(value => Number(value) > 0)) ||
+                (Array.isArray(p.director_reference_images_cached) && p.director_reference_images_cached.length > 0) ||
+                (typeof formData.keys === 'function' && [...formData.keys()].some(key => /^director_ref_\d+$/i.test(String(key))));
+            if (!nativeRequestHasReference) return false;
+        }
 
         const image = await naiNotionReferenceDbGetItem(active.itemId);
         if (!image?.blob || typeof image.blob.arrayBuffer !== 'function') {
