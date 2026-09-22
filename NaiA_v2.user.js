@@ -1,7 +1,7 @@
     // ==UserScript==
 // @name         NAI Archive
 // @namespace    https://github.com/Dflashh/
-// @version      1.0.12
+// @version      1.0.14
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
 // @downloadURL  https://raw.githubusercontent.com/Dflashh/Nai/main/Archive/NaiA.user.js
@@ -32,7 +32,7 @@
     'use strict';
 
     const APP_NAME = 'NAI Archive';
-    const APP_VERSION = '1.0.12';
+    const APP_VERSION = '1.0.14';
     const BUTTON_ID = 'nai-concept-loader-button';
     const MODAL_ID = 'nai-concept-loader-modal';
     const SETTINGS_KEY = 'naiConceptLoader.settings';
@@ -85,6 +85,7 @@
     // to capture its own reference to window.fetch. The function declaration is
     // hoisted; active-reference data is only read later, when a generation occurs.
     installNaiArchiveReferenceInterceptor();
+    setTimeout(() => installNaiArchiveReferenceSync(), 0);
 
     const tokenCache = Object.create(null);
     let firebaseSdkPromise = null;
@@ -16626,47 +16627,75 @@ ${pagePayload}
 
     async function naiNotionReplaceConceptInNovelAI(item, baseMode = 'replace') {
         const normalized = normalizeConceptRecord(item);
-        const base = await activateMainPrompt('base');
-        if (!base.ok) return base;
-        const baseValue =
-            baseMode === 'append'
-                ? naiNotionAppendPromptTail(
-                    naiNotionEditorText(base.editor),
-                    normalized.tags || ''
-                )
-                : String(normalized.tags || '');
-        let result = await naiNotionSetEditorText(base.editor, baseValue);
-        if (!result.ok) return result;
-        const neg = await activateMainPrompt('negative');
-        if (!neg.ok) return neg;
-        result = await naiNotionSetEditorText(neg.editor, normalized.negativeTags || '');
-        if (!result.ok) return result;
+        const positive = String(normalized.tags || '').trim();
+        const negative = String(normalized.negativeTags || '').trim();
         const characters = normalizeCharacterRows(normalized.characters);
+        let result = { ok: true };
 
-        // Only replace Character slots that actually exist in this preset.
-        // Never delete, clear, or otherwise touch Character 2+ just because
-        // the applied preset contains fewer Character rows.
+        // Personal-library presets are partial presets, not full snapshots.
+        // Only touch fields that actually contain content. This prevents a
+        // character-only preset from wiping the current Base Prompt / UC.
+        if (positive) {
+            const base = await activateMainPrompt('base');
+            if (!base.ok) return base;
+            const baseValue =
+                baseMode === 'append'
+                    ? naiNotionAppendPromptTail(
+                        naiNotionEditorText(base.editor),
+                        positive
+                    )
+                    : positive;
+            result = await naiNotionSetEditorText(base.editor, baseValue);
+            if (!result.ok) return result;
+        }
+
+        if (negative) {
+            const neg = await activateMainPrompt('negative');
+            if (!neg.ok) return neg;
+            result = await naiNotionSetEditorText(neg.editor, negative);
+            if (!result.ok) return result;
+        }
+
+        // Only replace Character fields that actually exist in this preset.
+        // Never delete, clear, or otherwise touch empty Character fields or
+        // Character 2+ just because the applied preset contains fewer rows.
         if (characters.length > 0) {
             const ensured = await ensureCharacterPromptCount(characters.length);
             if (!ensured.ok) return ensured;
 
             for (let i = 0; i < characters.length; i++) {
                 const index = i + 1;
-                const p = await activateCharacterPrompt(index, 'prompt');
-                if (!p.ok) return p;
-                result = await naiNotionSetEditorText(p.editor, characters[i].prompt || '');
-                if (!result.ok) return result;
+                const characterPrompt = String(characters[i].prompt || '').trim();
+                const characterNegative = String(characters[i].negativePrompt || '').trim();
 
-                const n = await activateCharacterPrompt(index, 'negative');
-                if (!n.ok) return n;
-                result = await naiNotionSetEditorText(n.editor, characters[i].negativePrompt || '');
-                if (!result.ok) return result;
+                if (characterPrompt) {
+                    const p = await activateCharacterPrompt(index, 'prompt');
+                    if (!p.ok) return p;
+                    result = await naiNotionSetEditorText(p.editor, characterPrompt);
+                    if (!result.ok) return result;
+                }
 
-                await activateCharacterPrompt(index, 'prompt');
+                if (characterNegative) {
+                    const n = await activateCharacterPrompt(index, 'negative');
+                    if (!n.ok) return n;
+                    result = await naiNotionSetEditorText(n.editor, characterNegative);
+                    if (!result.ok) return result;
+                }
+
+                if (characterPrompt || characterNegative) {
+                    await activateCharacterPrompt(index, 'prompt');
+                }
             }
         }
+
         await activateMainPrompt('base');
-        return { ok: true, insertedPositive: !!normalized.tags, insertedNegative: !!normalized.negativeTags, insertedCharacters: characters.filter(x => x.prompt).length, insertedCharacterNegatives: characters.filter(x => x.negativePrompt).length };
+        return {
+            ok: true,
+            insertedPositive: !!positive,
+            insertedNegative: !!negative,
+            insertedCharacters: characters.filter(x => String(x.prompt || '').trim()).length,
+            insertedCharacterNegatives: characters.filter(x => String(x.negativePrompt || '').trim()).length
+        };
     }
 
     function naiNotionExternalCharacterRows(item) {
@@ -18700,6 +18729,25 @@ ${pagePayload}
         return true;
     }
 
+    let naiNotionNativeReferenceSyncGuardUntil = 0;
+    let naiNotionNativeReferenceTrackedPanel = null;
+    let naiNotionNativeReferenceObserver = null;
+    let naiNotionNativeReferenceCheckTimer = 0;
+
+    function naiNotionGuardNativeReferenceSync(ms = 1400) {
+        naiNotionNativeReferenceSyncGuardUntil = Math.max(
+            naiNotionNativeReferenceSyncGuardUntil,
+            Date.now() + Math.max(0, Number(ms) || 0)
+        );
+    }
+
+    async function naiNotionClearArchiveReferenceState() {
+        GM_deleteValue(NAI_NOTION.activeReferenceKey);
+        await naiNotionReferenceDbClear();
+        naiNotionNativeReferenceTrackedPanel = null;
+        try { naiNotionController?.renderLibraryPanel?.(); } catch (_) {}
+    }
+
     function naiNotionFindNativeReferencePanel() {
         const nodes = [...document.querySelectorAll('div,section,article,aside')]
             .filter(naiNotionReferenceVisible)
@@ -18713,6 +18761,144 @@ ${pagePayload}
                 return (ar.width * ar.height) - (br.width * br.height);
             });
         return nodes[0] || null;
+    }
+
+    function naiNotionFindNativeReferenceRemoveButton(panel = null) {
+        const referencePanel = panel || naiNotionFindNativeReferencePanel();
+        if (!referencePanel) return null;
+
+        const scopes = [referencePanel];
+        let parent = referencePanel.parentElement;
+        for (let depth = 0; parent && depth < 3; depth += 1, parent = parent.parentElement) scopes.push(parent);
+
+        const candidates = [];
+        const seen = new Set();
+        for (const scope of scopes) {
+            for (const button of scope.querySelectorAll('button,[role="button"]')) {
+                if (seen.has(button) || !naiNotionReferenceVisible(button)) continue;
+                seen.add(button);
+                const text = naiNotionReferenceText(button).trim();
+                const meta = [
+                    text,
+                    button.getAttribute?.('aria-label') || '',
+                    button.getAttribute?.('title') || '',
+                    button.getAttribute?.('data-tooltip') || '',
+                    button.getAttribute?.('data-testid') || ''
+                ].join(' ').trim();
+                const insidePanel = referencePanel.contains(button);
+                const rect = button.getBoundingClientRect();
+                const panelRect = referencePanel.getBoundingClientRect();
+                const topRight = rect.top <= panelRect.top + 100 && rect.right >= panelRect.right - 140;
+
+                if (/remove|delete|clear|제거|삭제|지우|クリア|削除/i.test(meta)) {
+                    candidates.push({ button, score: 120 + (insidePanel ? 20 : 0) + (topRight ? 10 : 0) });
+                    continue;
+                }
+                if (/^(?:×|x|✕|✖|❌)$/i.test(text)) {
+                    candidates.push({ button, score: 100 + (insidePanel ? 20 : 0) + (topRight ? 10 : 0) });
+                    continue;
+                }
+                if (!text && button.querySelector('svg') && topRight) {
+                    candidates.push({ button, score: 60 + (insidePanel ? 15 : 0) });
+                }
+            }
+        }
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0]?.button || null;
+    }
+
+    async function naiNotionRemoveNativeReferenceFromNovelAIUi() {
+        if (!/novelai\.net$/i.test(location.hostname)) return true;
+        const panel = naiNotionFindNativeReferencePanel();
+        if (!panel) {
+            naiNotionNativeReferenceTrackedPanel = null;
+            return true;
+        }
+
+        const removeButton = naiNotionFindNativeReferenceRemoveButton(panel);
+        if (!removeButton) return false;
+
+        naiNotionGuardNativeReferenceSync(2400);
+        removeButton.click();
+        const removed = await naiNotionWaitFor(() => {
+            if (!panel.isConnected) return true;
+            const current = naiNotionFindNativeReferencePanel();
+            return !current;
+        }, 1800, 90);
+        if (removed) naiNotionNativeReferenceTrackedPanel = null;
+        return Boolean(removed);
+    }
+
+    function installNaiArchiveReferenceSync() {
+        if (!/novelai\.net$/i.test(location.hostname)) return;
+        const page = PAGE_WINDOW;
+        if (page.__naiArchiveReferenceSyncInstalled) return;
+        page.__naiArchiveReferenceSyncInstalled = true;
+
+        const check = async () => {
+            const active = naiNotionGetActiveReference();
+            if (!active) {
+                naiNotionNativeReferenceTrackedPanel = null;
+                return;
+            }
+
+            if (naiNotionNativeReferenceTrackedPanel?.isConnected) return;
+
+            const replacement = naiNotionFindNativeReferencePanel();
+            if (replacement) {
+                naiNotionNativeReferenceTrackedPanel = replacement;
+                return;
+            }
+
+            // Only interpret disappearance as an explicit user OFF after a native
+            // panel had actually been observed. This avoids clearing state merely
+            // because NovelAI has not rendered the panel yet.
+            if (!naiNotionNativeReferenceTrackedPanel) return;
+            if (Date.now() < naiNotionNativeReferenceSyncGuardUntil) return;
+
+            const disappearedPanel = naiNotionNativeReferenceTrackedPanel;
+            await new Promise(resolve => setTimeout(resolve, 360));
+            if (Date.now() < naiNotionNativeReferenceSyncGuardUntil) return;
+            if (disappearedPanel.isConnected) return;
+
+            const lateReplacement = naiNotionFindNativeReferencePanel();
+            if (lateReplacement) {
+                naiNotionNativeReferenceTrackedPanel = lateReplacement;
+                return;
+            }
+            if (naiNotionGetActiveReference()) {
+                await naiNotionClearArchiveReferenceState();
+                naiNotionToast('NovelAI에서 레퍼런스를 제거해 Archive 레퍼런스도 OFF했습니다.');
+            }
+        };
+
+        const scheduleCheck = () => {
+            clearTimeout(naiNotionNativeReferenceCheckTimer);
+            naiNotionNativeReferenceCheckTimer = setTimeout(() => check().catch(() => {}), 140);
+        };
+
+        const install = () => {
+            if (naiNotionNativeReferenceObserver || !document.documentElement) return;
+            naiNotionNativeReferenceObserver = new MutationObserver(scheduleCheck);
+            naiNotionNativeReferenceObserver.observe(document.documentElement, { childList: true, subtree: true });
+            document.addEventListener('click', scheduleCheck, true);
+
+            // If an active Archive reference survived a reload, make it visible
+            // again instead of leaving an invisible request-only reference active.
+            setTimeout(() => {
+                const active = naiNotionGetActiveReference();
+                if (!active) return;
+                const panel = naiNotionFindNativeReferencePanel();
+                if (panel) {
+                    naiNotionNativeReferenceTrackedPanel = panel;
+                    return;
+                }
+                naiNotionScheduleNativeReferenceInsert();
+            }, 700);
+        };
+
+        if (document.documentElement) install();
+        else document.addEventListener('DOMContentLoaded', install, { once: true });
     }
 
     async function naiNotionSyncNativeReferenceControls(preset, preferredPanel = null) {
@@ -18777,6 +18963,7 @@ ${pagePayload}
         // Character & Style reference every time the settings were changed.
         const existingPanel = naiNotionFindNativeReferencePanel();
         if (existingPanel) {
+            naiNotionNativeReferenceTrackedPanel = existingPanel;
             return await naiNotionSyncNativeReferenceControls(active, existingPanel);
         }
 
@@ -18855,10 +19042,13 @@ ${pagePayload}
         if (secondPreciseButton) secondPreciseButton.click();
 
         const controlsSynced = await naiNotionSyncNativeReferenceControls(active);
-        return Boolean(preciseButton || secondPreciseButton || controlsSynced);
+        const nativePanel = naiNotionFindNativeReferencePanel();
+        if (nativePanel) naiNotionNativeReferenceTrackedPanel = nativePanel;
+        return Boolean(preciseButton || secondPreciseButton || controlsSynced || nativePanel);
     }
 
     function naiNotionScheduleNativeReferenceInsert() {
+        naiNotionGuardNativeReferenceSync(3200);
         setTimeout(() => {
             naiNotionInsertActiveReferenceIntoNovelAIUi().then(ok => {
                 if (!ok) {
@@ -18941,8 +19131,14 @@ ${pagePayload}
     async function naiNotionDisablePreciseReference(item = null) {
         const active = naiNotionGetActiveReference();
         if (item && active && active.itemId !== naiNotionReferenceItemId(item)) return false;
-        GM_deleteValue(NAI_NOTION.activeReferenceKey);
-        await naiNotionReferenceDbClear();
+
+        const nativeRemoved = await naiNotionRemoveNativeReferenceFromNovelAIUi();
+        if (!nativeRemoved) {
+            naiNotionToast('NovelAI 레퍼런스 제거 버튼을 찾지 못해 OFF하지 않았습니다.', true);
+            return false;
+        }
+
+        await naiNotionClearArchiveReferenceState();
         return true;
     }
 
@@ -19016,7 +19212,11 @@ ${pagePayload}
 
             overlay.querySelector('[data-ref-off]').onclick = async () => {
                 status.textContent = 'Reference 끄는 중…';
-                await naiNotionDisablePreciseReference(item);
+                const disabled = await naiNotionDisablePreciseReference(item);
+                if (!disabled) {
+                    status.textContent = 'NovelAI 레퍼런스 제거를 확인하지 못했습니다.';
+                    return;
+                }
                 naiNotionToast('레퍼런스 OFF');
                 finish({ enabled: false });
             };
