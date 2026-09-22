@@ -1,11 +1,11 @@
     // ==UserScript==
 // @name         NAI Archive
 // @namespace    https://github.com/Dflashh/
-// @version      1.0.11
+// @version      1.0.12
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
-// @downloadURL  https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
-// @updateURL    https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
+// @downloadURL  https://raw.githubusercontent.com/Dflashh/Nai/main/Archive/NaiA.user.js
+// @updateURL    https://raw.githubusercontent.com/Dflashh/Nai/main/Archive/NaiA.user.js
 // @match        https://novelai.net/*
 // @match        https://*.notion.site/*
 // @match        https://notion.site/*
@@ -32,7 +32,7 @@
     'use strict';
 
     const APP_NAME = 'NAI Archive';
-    const APP_VERSION = '1.0.11';
+    const APP_VERSION = '1.0.12';
     const BUTTON_ID = 'nai-concept-loader-button';
     const MODAL_ID = 'nai-concept-loader-modal';
     const SETTINGS_KEY = 'naiConceptLoader.settings';
@@ -20076,7 +20076,7 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
       .nai-notion-inline-status{display:inline-flex;align-items:center;min-height:22px;margin:0;color:#aeb3cc;font-size:11px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
       .nai-notion-inline-status:empty{display:none}
       .nai-notion-detail-actions .nai-notion-inline-status{margin:0 2px}
-      .nai-notion-confirm-modal{width:min(460px,calc(100vw - 28px));height:auto}.nai-notion-confirm-message{padding:6px 2px 14px;color:#e7e9f4;font-size:13px;line-height:1.6;white-space:normal}.nai-notion-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px}
+      .nai-notion-confirm-modal{width:min(460px,calc(100vw - 28px));height:auto;min-height:0;max-height:none}.nai-notion-confirm-modal>.nai-loader-content{flex:0 0 auto;min-height:0;overflow:visible}.nai-notion-confirm-modal .nai-loader-panel{padding:14px 18px 16px}.nai-notion-confirm-message{padding:4px 2px 12px;color:#e7e9f4;font-size:13px;line-height:1.6;white-space:normal}.nai-notion-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px}
       .nai-notion-db-manager-modal{width:min(680px,calc(100vw - 28px));max-height:min(760px,calc(100vh - 28px))}.nai-notion-db-manager-toolbar{align-items:center;gap:7px}.nai-notion-db-manager-list{display:flex;flex-direction:column;gap:6px;max-height:430px;overflow:auto;padding:2px 3px 2px 0}.nai-notion-db-choice{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid #343850;border-radius:8px;background:#181a2a;color:#e7e9f4;cursor:pointer;transition:border-color .15s ease,background .15s ease}.nai-notion-db-choice:hover{border-color:#68599f;background:#1d1f32}.nai-notion-db-choice>input{flex:0 0 auto;width:15px;height:15px;margin:0}.nai-notion-db-choice-main{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}.nai-notion-db-choice-main strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-db-choice-main small{font-size:10px;color:#858ba8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-db-current{flex:0 0 auto;padding:3px 6px;border-radius:999px;background:#30294a;color:#bca8ff;font-size:9px;font-weight:700}
       .nai-notion-external-db-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin:10px 0}.nai-notion-external-bulk-sync{display:flex;align-items:center;gap:8px;margin-bottom:12px}.nai-notion-external-bulk-sync .nai-notion-inline-status{font-size:10px;color:#9b9fba}.nai-notion-external-bulk-sync .nai-notion-inline-status.error{color:#ff6f7d}.nai-notion-external-db-choice small.error{color:#ff6f7d}.nai-notion-external-db-list{display:flex;flex-direction:column;gap:12px}.nai-notion-external-db-group{display:flex;flex-direction:column;gap:6px}.nai-notion-external-db-group-title{font-size:11px;font-weight:800;color:#c9c1ec;padding:0 2px}.nai-notion-external-db-group-rows{display:flex;flex-direction:column;gap:6px}.nai-notion-external-db-choice{appearance:none;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;border:1px solid #343850;border-radius:8px;background:#181a2a;color:#e7e9f4;padding:10px 11px;cursor:pointer}.nai-notion-external-db-choice:hover,.nai-notion-external-db-choice.active{border-color:#7f66d4;background:#211f37}.nai-notion-external-db-choice>span:first-child{display:flex;flex-direction:column;gap:3px;min-width:0}.nai-notion-external-db-choice strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-external-db-choice small{font-size:10px;color:#858ba8}
 
