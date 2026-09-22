@@ -1,7 +1,7 @@
     // ==UserScript==
 // @name         NAI Archive
 // @namespace    https://github.com/Dflashh/
-// @version      1.0.15
+// @version      1.0.21
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
 // @downloadURL  https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
@@ -32,11 +32,12 @@
     'use strict';
 
     const APP_NAME = 'NAI Archive';
-    const APP_VERSION = '1.0.15';
+    const APP_VERSION = '1.0.21';
     const BUTTON_ID = 'nai-concept-loader-button';
     const MODAL_ID = 'nai-concept-loader-modal';
     const SETTINGS_KEY = 'naiConceptLoader.settings';
     const LIBRARY_KEY = 'naiConceptLoader.library';
+    const LIBRARY_SCROLL_KEY = 'naiConceptLoader.libraryScrollTopV1';
     const LIBRARY_CATEGORY_KEY = 'naiConceptLoader.libraryCategories';
     const RESOURCE_KEY = 'naiConceptLoader.resources';
     const RESOURCE_CATEGORY_KEY = 'naiConceptLoader.resourceCategories';
@@ -278,6 +279,7 @@
         }
 
         .nai-loader-modal {
+            position: relative;
             width: min(780px, calc(100vw - 28px));
             height: calc(100vh - 36px);
             max-height: calc(100vh - 36px);
@@ -377,6 +379,58 @@
             flex: 1 1 auto;
             overflow-y: auto;
             min-height: 300px;
+        }
+
+        .nai-loader-content.nai-library-scroll-mode {
+            scrollbar-width: none;
+        }
+
+        .nai-loader-content.nai-library-scroll-mode::-webkit-scrollbar {
+            width: 0;
+            height: 0;
+        }
+
+        .nai-loader-scroll-rail {
+            position: absolute;
+            top: 83px;
+            right: 4px;
+            bottom: 9px;
+            width: 8px;
+            z-index: 12;
+            border-radius: 999px;
+            background: rgba(11, 12, 20, 0.56);
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+            cursor: pointer;
+            user-select: none;
+            touch-action: none;
+        }
+
+        .nai-loader-scroll-rail[hidden] {
+            display: none !important;
+        }
+
+        .nai-loader-scroll-thumb {
+            position: absolute;
+            left: 1px;
+            right: 1px;
+            top: 0;
+            min-height: 34px;
+            border-radius: 999px;
+            background: #71658f;
+            opacity: 0.9;
+            cursor: grab;
+            transition: background 0.12s ease, opacity 0.12s ease;
+        }
+
+        .nai-loader-scroll-thumb:hover {
+            background: #8c7ab7;
+            opacity: 1;
+        }
+
+        .nai-loader-scroll-thumb.dragging {
+            cursor: grabbing;
+            background: #9b86cf;
+            opacity: 1;
         }
 
         .nai-loader-panel {
@@ -6281,8 +6335,102 @@ ${sourcePart}
                     'queryCollection selected external DB'
                 );
                 const recovered = mergeQueryResult(result?.data);
-                if (recovered) {
-                    fullQueryWorked = true;
+                const directGroup =
+                    result?.data?.result?.reducerResults?.collection_group_results ||
+                    null;
+                sizeHint = Math.max(
+                    sizeHint,
+                    Number(directGroup?.sizeHint || 0),
+                    Number(result?.data?.result?.sizeHint || 0),
+                    rowIds.size
+                );
+
+                // Public Notion DBs commonly return only the first row page.
+                // If queryCollection says there are more rows, replay the
+                // compiled loader with a large results limit before fetching
+                // row bodies. Without this step a 200+ row library can look
+                // successfully synced while silently keeping only the first page.
+                const directHasMore = Boolean(directGroup?.hasMore);
+                const compiled = cloneJson(result?.data?.compiledRequest);
+                if (
+                    (directHasMore || (sizeHint && rowIds.size < sizeHint)) &&
+                    compiled?.source?.id &&
+                    compiled?.collectionView?.id &&
+                    compiled?.loader
+                ) {
+                    const expandedLoader = cloneJson(compiled.loader) || {};
+                    expandedLoader.type = expandedLoader.type || 'reducer';
+                    expandedLoader.reducers =
+                        expandedLoader.reducers && typeof expandedLoader.reducers === 'object'
+                            ? expandedLoader.reducers
+                            : {};
+                    for (const reducer of Object.values(expandedLoader.reducers)) {
+                        if (
+                            reducer &&
+                            typeof reducer === 'object' &&
+                            String(reducer.type || '') === 'results'
+                        ) {
+                            reducer.limit = 9999;
+                            if ('loadContentCover' in reducer) reducer.loadContentCover = false;
+                        }
+                    }
+                    if (!expandedLoader.reducers.collection_group_results) {
+                        expandedLoader.reducers.collection_group_results = {
+                            type: 'results',
+                            limit: 9999,
+                            loadContentCover: false
+                        };
+                    }
+
+                    const expandedPayload = {
+                        collection: {
+                            id: compiled.source.id,
+                            ...(compiled.source.spaceId
+                                ? { spaceId: compiled.source.spaceId }
+                                : {})
+                        },
+                        collectionView: {
+                            id: compiled.collectionView.id,
+                            ...(compiled.collectionView.spaceId
+                                ? { spaceId: compiled.collectionView.spaceId }
+                                : {})
+                        },
+                        loader: expandedLoader
+                    };
+
+                    notionCrawlerJobWrite({
+                        ...(notionCrawlerJobRead() || job),
+                        message:
+                            `“${targetDatabase.name || '외부 DB'}” 전체 row 확장 중… ` +
+                            `${rowIds.size}${sizeHint ? `/${sizeHint}` : ''}`
+                    });
+
+                    try {
+                        const expandedResult = await notionNetworkGmPostJson(
+                            `${origin}/api/v3/queryCollection?src=initial_load`,
+                            expandedPayload,
+                            'queryCollection selected external DB expanded'
+                        );
+                        mergeQueryResult(expandedResult?.data);
+                        const expandedGroup =
+                            expandedResult?.data?.result?.reducerResults?.collection_group_results ||
+                            null;
+                        sizeHint = Math.max(
+                            sizeHint,
+                            Number(expandedGroup?.sizeHint || 0),
+                            Number(expandedResult?.data?.result?.sizeHint || 0),
+                            rowIds.size
+                        );
+                    } catch (error) {
+                        console.warn(
+                            `[${APP_NAME}] selected external DB expanded query skipped`,
+                            error
+                        );
+                    }
+                }
+
+                if (recovered || rowIds.size) {
+                    fullQueryWorked = !sizeHint || rowIds.size >= sizeHint;
                     notionCrawlerJobWrite({
                         ...(notionCrawlerJobRead() || job),
                         message: `“${targetDatabase.name || '외부 DB'}” row ${rowIds.size}` + (sizeHint ? `/${sizeHint}` : '')
@@ -6355,168 +6503,26 @@ ${sourcePart}
             return { rows: 0, pageChunks: 0, readablePages };
         }
 
-        // In the real queryCollection response each row page is present, but its
-        // `content` array points at child block ids which are NOT included in
-        // recordMap.  loadCachedPageChunkV2 on a collection row is unreliable.
-        // Notion itself resolves those pointers with syncRecordValues*, so do
-        // the same directly and recursively.
-        let spaceId =
-            String(queryState?.compiledRequest?.source?.spaceId || '') ||
-            String(queryState?.compiledRequest?.collectionView?.spaceId || '') ||
-            String(fallbackContext.spaceId || '');
-        if (!spaceId) {
-            for (const block of Object.values(blockRecords)) {
-                if (block?.space_id) {
-                    spaceId = String(block.space_id);
-                    break;
-                }
-            }
-        }
+        // Roll back the recursive syncRecordValues child-block crawler.
+        // It could sit on one unresolved batch for minutes (e.g. 50 acquired /
+        // 224 unresolved) before the UI moved at all.  The older stable path
+        // loads each collection row through loadCachedPageChunkV2 instead.
+        // Each row/chunk gets a bounded retry, so a transient Notion failure
+        // cannot stall the whole external-library sync indefinitely.
+        notionCrawlerJobWrite({
+            ...(notionCrawlerJobRead() || job),
+            message:
+                `Notion row 본문 내부 API 조회 준비 · ${pageIds.length}` +
+                (sizeHint ? `/${sizeHint}` : '') +
+                `개`
+        });
 
-        let syncRequests = 0;
-        let syncedBlocks = 0;
-        // Do NOT mark a child as completed before Notion actually returns it.
-        // The old code did that, so one transient timeout permanently skipped
-        // the entire batch and made expansion stop at a random point.
-        const completedIds = new Set();
-        const attemptCounts = new Map();
-        const MAX_BLOCK_ATTEMPTS = 4;
-        const SYNC_BATCH_SIZE = 36;
-
-        const mergeSyncData = data => {
-            const compact = notionNetworkExtractCompactBlocks(data);
-            let added = 0;
-            const returnedIds = [];
-            for (const [id, block] of Object.entries(compact)) {
-                returnedIds.push(id);
-                if (!blockRecords[id]) added += 1;
-                blockRecords[id] = notionNetworkMergeCompactBlock(blockRecords[id], block);
-                completedIds.add(id);
-                if (!spaceId && block?.space_id) spaceId = String(block.space_id);
-            }
-            Object.assign(propertyNames, notionNetworkExtractPropertyNames(data));
-            syncedBlocks += added;
-            return { added, returnedIds };
-        };
-
-        const syncBatch = async ids => {
-            if (!ids.length || !spaceId) return { added: 0, returnedIds: [] };
-            const payload = {
-                requests: ids.map(id => ({
-                    pointer: {
-                        table: 'block',
-                        id,
-                        spaceId
-                    },
-                    version: -1
-                }))
-            };
-            const endpoints = [
-                `${origin}/api/v3/syncRecordValues`,
-                'https://www.notion.so/api/v3/syncRecordValues'
-            ];
-            let lastError = null;
-
-            // Internal Notion endpoints are occasionally flaky. Retry the SAME
-            // unresolved ids with backoff instead of discarding them forever.
-            for (let attempt = 0; attempt < 3; attempt++) {
-                for (const endpoint of [...new Set(endpoints)]) {
-                    try {
-                        const result = await notionNetworkGmPostJson(
-                            endpoint,
-                            payload,
-                            'syncRecordValues'
-                        );
-                        syncRequests += 1;
-                        const merged = mergeSyncData(result?.data);
-                        if (result?.data?.recordMap?.block) return merged;
-                    } catch (error) {
-                        lastError = error;
-                    }
-                }
-                if (attempt < 2) await sleepMs(350 * (2 ** attempt));
-            }
-
-            for (const id of ids) {
-                attemptCounts.set(id, (attemptCounts.get(id) || 0) + 1);
-            }
-            if (lastError) throw lastError;
-            return { added: 0, returnedIds: [] };
-        };
-
-        if (spaceId) {
-            for (let round = 0; round < 14; round++) {
-                const missingSet = new Set();
-                for (const block of Object.values(blockRecords)) {
-                    for (const childId of Array.isArray(block?.content) ? block.content : []) {
-                        if (
-                            !blockRecords[childId] &&
-                            !completedIds.has(childId) &&
-                            (attemptCounts.get(childId) || 0) < MAX_BLOCK_ATTEMPTS
-                        ) {
-                            missingSet.add(childId);
-                        }
-                    }
-                }
-                const missing = [...missingSet];
-                if (!missing.length) break;
-
-                notionCrawlerJobWrite({
-                    ...(notionCrawlerJobRead() || job),
-                    message:
-                        `Notion row 본문 block 직접 조회 중… ` +
-                        `${Object.keys(blockRecords).length}개 확보 · 미해결 ${missing.length}개 · 재시도 ${round + 1}`
-                });
-
-                let roundAdded = 0;
-                let roundReturned = 0;
-                let roundFailures = 0;
-                for (let i = 0; i < missing.length; i += SYNC_BATCH_SIZE) {
-                    const batch = missing.slice(i, i + SYNC_BATCH_SIZE);
-                    try {
-                        const merged = await syncBatch(batch);
-                        roundAdded += merged.added || 0;
-                        roundReturned += merged.returnedIds?.length || 0;
-
-                        // If Notion returned only part of a requested batch, only
-                        // those returned ids are completed. The rest stay eligible
-                        // for a later retry.
-                        const returned = new Set(merged.returnedIds || []);
-                        for (const id of batch) {
-                            if (!returned.has(id) && !blockRecords[id]) {
-                                attemptCounts.set(id, (attemptCounts.get(id) || 0) + 1);
-                            }
-                        }
-                    } catch (error) {
-                        roundFailures += 1;
-                        console.warn(`[${APP_NAME}] syncRecordValues batch retry later`, error);
-                    }
-
-                    notionCrawlerJobWrite({
-                        ...(notionCrawlerJobRead() || job),
-                        message:
-                            `Notion row 본문 block 직접 조회 중… ` +
-                            `${Object.keys(blockRecords).length}개 확보 · ` +
-                            `${Math.min(i + batch.length, missing.length)}/${missing.length}` +
-                            (roundFailures ? ` · 실패 ${roundFailures}배치 재시도 예정` : '')
-                    });
-
-                    // Smaller batches + a modest pause are much more stable on
-                    // public Notion than bursts of 100 records.
-                    if (i + SYNC_BATCH_SIZE < missing.length) await sleepMs(260);
-                }
-
-                // New child blocks can reveal another generation of children.
-                // Even when this round returned nothing, keep retrying unresolved
-                // ids until their attempt budget is exhausted instead of stopping
-                // the whole crawl immediately.
-                if (!roundAdded && !roundReturned) await sleepMs(700);
-            }
-        }
-
-        // Build the readable rows from the compact in-memory record map.  This
-        // bypasses the old 620k response truncation entirely.
-        const synthetic = notionNetworkSyntheticCapture(blockRecords, propertyNames);
+        let completed = 0;
+        let successful = 0;
+        let retryCount = 0;
+        let cursor = 0;
+        const failedRows = new Set();
+        const readableByKey = new Map();
 
         const attachExactRowImages = pages => {
             for (const page of pages || []) {
@@ -6525,13 +6531,13 @@ ${sourcePart}
                 const imageMeta = rowImageRefs[id];
                 if (!imageMeta?.attachment) continue;
                 const row = blockRecords[id];
-                const spaceId =
+                const rowSpaceId =
                     String(imageMeta.spaceId || '') ||
                     String(row?.space_id || row?.spaceId || '');
                 const exactUrl = notionNetworkPublicImageUrl(
                     job.rootUrl || location.href,
                     id,
-                    spaceId,
+                    rowSpaceId,
                     {},
                     String(imageMeta.attachment)
                 );
@@ -6540,72 +6546,167 @@ ${sourcePart}
             return pages;
         };
 
-        let readablePages = attachExactRowImages(notionNetworkBuildReadablePages(
-            job.rootUrl || location.href,
-            [synthetic]
-        )).filter(page => {
-            const text = String(page?.text || '');
-            // A title + page id only is not a useful prompt page.
-            return /\[(?:code|text|heading|bulleted_list|numbered_list|toggle|quote|callout|block)\]|PROPERTY\s+/i.test(text);
-        });
+        const mergeReadablePages = captures => {
+            const pages = attachExactRowImages(notionNetworkBuildReadablePages(
+                job.rootUrl || location.href,
+                captures
+            ));
+            for (const page of pages) {
+                const key = String(page?.id || page?.url || '');
+                if (key) readableByKey.set(key, page);
+            }
+        };
 
-        // Last-resort API-only fallback: if syncRecordValues yielded no child
-        // text, try loadCachedPageChunkV2 on a limited number of rows.  This is
-        // still internal-API-only and never reads DOM text.
-        let pageChunkSuccess = 0;
-        if (!readablePages.length) {
-            const extraCaptures = [];
-            const retryIds = pageIds.slice(0, 60);
-            let cursor = 0;
-            const workerCount = Math.min(4, retryIds.length || 1);
-            const worker = async () => {
-                while (true) {
-                    const index = cursor++;
-                    if (index >= retryIds.length) return;
-                    const pageId = retryIds[index];
-                    try {
-                        const result = await notionNetworkGmPostJson(
-                            `${origin}/api/v3/loadCachedPageChunkV2`,
-                            {
-                                page: { id: pageId },
-                                limit: 100,
-                                cursor: { stack: [] },
-                                chunkNumber: 0,
-                                verticalColumns: false
-                            },
-                            'loadCachedPageChunkV2'
-                        );
-                        pageChunkSuccess += 1;
-                        extraCaptures.push({
-                            url: result.url || '',
-                            method: 'POST',
-                            status: result.status || 200,
-                            requestBody: result.requestBody || '',
-                            responseText: String(result.responseText || ''),
-                            priority: 95,
-                            capturedAt: Date.now()
-                        });
-                    } catch (_) {}
+        // Preserve row titles/properties already recovered from queryCollection.
+        if (Object.keys(blockRecords).length) {
+            mergeReadablePages([
+                notionNetworkSyntheticCapture(blockRecords, propertyNames)
+            ]);
+        }
+        mergeReadablePages(initialCaptures);
+
+        const loadPageChunkWithRetry = async (pageId, payload, chunkNumber) => {
+            let lastError = null;
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    return await notionNetworkGmPostJson(
+                        `${origin}/api/v3/loadCachedPageChunkV2`,
+                        payload,
+                        'loadCachedPageChunkV2'
+                    );
+                } catch (error) {
+                    lastError = error;
+                    if (attempt >= maxAttempts) break;
+                    retryCount += 1;
+                    notionCrawlerJobWrite({
+                        ...(notionCrawlerJobRead() || job),
+                        message:
+                            `Notion row 본문 재시도 중… ` +
+                            `${completed}/${pageIds.length} · ` +
+                            `재시도 ${attempt + 1}/${maxAttempts}`
+                    });
+                    await sleepMs(450 * attempt);
                 }
-            };
-            await Promise.all(Array.from({ length: workerCount }, () => worker()));
-            if (extraCaptures.length) {
-                readablePages = attachExactRowImages(notionNetworkBuildReadablePages(
-                    job.rootUrl || location.href,
-                    [synthetic, ...extraCaptures]
-                )).filter(page => {
-                    const text = String(page?.text || '');
-                    return /\[(?:code|text|heading|bulleted_list|numbered_list|toggle|quote|callout|block)\]|PROPERTY\s+/i.test(text);
+            }
+            throw lastError || new Error(
+                `loadCachedPageChunkV2 실패: ${pageId} / chunk ${chunkNumber}`
+            );
+        };
+
+        const fetchPage = async pageId => {
+            const pageCaptures = [];
+            let cursorState = { stack: [] };
+
+            for (let chunkNumber = 0; chunkNumber < 4; chunkNumber++) {
+                const payload = {
+                    page: { id: pageId },
+                    limit: 100,
+                    cursor: cursorState,
+                    chunkNumber,
+                    verticalColumns: false
+                };
+
+                let result;
+                try {
+                    result = await loadPageChunkWithRetry(
+                        pageId,
+                        payload,
+                        chunkNumber
+                    );
+                } catch (error) {
+                    failedRows.add(pageId);
+                    console.warn(
+                        `[${APP_NAME}] public Notion page chunk failed after retry`,
+                        pageId,
+                        error
+                    );
+                    break;
+                }
+
+                successful += 1;
+                pageCaptures.push({
+                    url: result.url || '',
+                    method: 'POST',
+                    status: result.status || 200,
+                    requestBody: result.requestBody || '',
+                    responseText: String(result.responseText || ''),
+                    priority: 95,
+                    capturedAt: Date.now()
                 });
+
+                const data = result?.data || {};
+                const cursors = Array.isArray(data?.cursors)
+                    ? data.cursors
+                    : [];
+                const next = cursors[0];
+                if (!next?.stack?.length) break;
+                cursorState = { stack: next.stack };
+            }
+
+            if (pageCaptures.length) mergeReadablePages(pageCaptures);
+        };
+
+        const workerCount = Math.min(5, Math.max(1, pageIds.length));
+        const worker = async () => {
+            while (true) {
+                const index = cursor++;
+                if (index >= pageIds.length) return;
+
+                await fetchPage(pageIds[index]);
+                completed += 1;
+
+                if (completed % 5 === 0 || completed === pageIds.length) {
+                    const current = notionCrawlerJobRead();
+                    if (!current || current.status !== 'running') return;
+                    notionCrawlerJobWrite({
+                        ...current,
+                        message:
+                            `Notion row 본문 내부 API 조회 중… ` +
+                            `${completed}/${pageIds.length}` +
+                            (retryCount ? ` · 재시도 ${retryCount}회` : '') +
+                            (failedRows.size ? ` · 실패 ${failedRows.size}개` : '')
+                    });
+                }
+            }
+        };
+
+        await Promise.all(
+            Array.from({ length: workerCount }, () => worker())
+        );
+
+        // Give rows that exhausted their first three attempts one final pass.
+        // This is deliberately row-level, not recursive child-block batching.
+        if (failedRows.size) {
+            const finalRetryIds = [...failedRows];
+            failedRows.clear();
+            notionCrawlerJobWrite({
+                ...(notionCrawlerJobRead() || job),
+                message: `Notion row 최종 재시도 중… ${finalRetryIds.length}개`
+            });
+            for (let i = 0; i < finalRetryIds.length; i++) {
+                await fetchPage(finalRetryIds[i]);
+                if ((i + 1) % 5 === 0 || i + 1 === finalRetryIds.length) {
+                    notionCrawlerJobWrite({
+                        ...(notionCrawlerJobRead() || job),
+                        message:
+                            `Notion row 최종 재시도 중… ` +
+                            `${i + 1}/${finalRetryIds.length}` +
+                            (failedRows.size ? ` · 남은 실패 ${failedRows.size}개` : '')
+                    });
+                }
             }
         }
 
+        const readablePages = attachExactRowImages(
+            [...readableByKey.values()]
+        ).filter(page => {
+            const text = String(page?.text || '').trim();
+            return text.length >= 20;
+        });
+
         job = notionCrawlerJobRead();
         if (job && job.status === 'running') {
-            const childRefs = new Set();
-            for (const id of pageIds) {
-                for (const childId of blockRecords[id]?.content || []) childRefs.add(childId);
-            }
             notionCrawlerJobWrite({
                 ...job,
                 expanded: true,
@@ -6616,20 +6717,22 @@ ${sourcePart}
                     sizeHint,
                     imagePropertyIds,
                     rowImageRefs,
-                    expandedAllRows: fullQueryWorked && pageIds.length >= sizeHint
+                    expandedAllRows: fullQueryWorked && (!sizeHint || pageIds.length >= sizeHint)
                 },
                 message:
                     `Notion 내부 API 확장 완료 · row ${pageIds.length}` +
                     (sizeHint ? `/${sizeHint}` : '') +
-                    ` · 자식 block ${syncedBlocks}개` +
+                    ` · 본문 응답 ${successful}개` +
                     ` · 복원 ${readablePages.length}개` +
+                    (retryCount ? ` · 재시도 ${retryCount}회` : '') +
+                    (failedRows.size ? ` · 최종 실패 ${failedRows.size}개` : '') +
                     ` · 이미지 ${readablePages.filter(page => page?.imageUrl).length}개`
             });
         }
 
         return {
             rows: pageIds.length,
-            pageChunks: syncRequests + pageChunkSuccess,
+            pageChunks: successful,
             readablePages
         };
     }
@@ -7490,15 +7593,29 @@ ${pagePayload}
             throw new Error('Notion 가로채기용 탭을 열 수 없습니다. novelai.net의 팝업을 허용해주세요.');
         }
 
-        const started = Date.now();
+        const idleTimeoutMs = NOTION_NETWORK_MAX_WAIT_MS + 90000;
+        let lastActivityAt = Date.now();
+        let lastSeenUpdatedAt = Number(job.updatedAt || lastActivityAt);
         let lastMessage = '';
         try {
-            while (Date.now() - started < NOTION_NETWORK_MAX_WAIT_MS + 90000) {
+            while (true) {
                 await sleepMs(350);
                 const current = notionCrawlerJobRead();
                 if (!current || current.id !== jobId) throw new Error('Notion 가로채기 작업 정보가 사라졌습니다.');
+
+                // Timeout is based on inactivity, not total sync duration.
+                // Any helper progress/update resets the idle timer so a long
+                // but healthy row crawl cannot be killed just because the
+                // overall job has been running for a while.
+                const updatedAt = Number(current.updatedAt || 0);
+                if (updatedAt > lastSeenUpdatedAt) {
+                    lastSeenUpdatedAt = updatedAt;
+                    lastActivityAt = Date.now();
+                }
+
                 if (current.message && current.message !== lastMessage) {
                     lastMessage = current.message;
+                    lastActivityAt = Date.now();
                     onStatus(current.message);
                 }
                 if (current.status === 'done') {
@@ -7522,8 +7639,10 @@ ${pagePayload}
                 }
                 if (current.status === 'error') throw new Error(current.error || 'Notion 내부 API 가로채기 실패');
                 if (helperTab.isClosed()) throw new Error('Notion 가로채기 탭이 완료 전에 닫혔습니다.');
+                if (Date.now() - lastActivityAt >= idleTimeoutMs) {
+                    throw new Error('Notion 내부 API 응답 대기 시간이 초과되었습니다.');
+                }
             }
-            throw new Error('Notion 내부 API 응답 대기 시간이 초과되었습니다.');
         } finally {
             GM_setValue(NOTION_BROWSER_JOB_KEY, null);
             helperTab.close();
@@ -8379,12 +8498,6 @@ ${pagePayload}
     async function analyzeNotionViaNetworkIntercept(url, settings, onStatus = () => {}, targetDatabase = null) {
         const rootUrl = normalizeUrl(url);
         const isPageSection = targetDatabase?.kind === 'page';
-        const isKnownDatabaseSection = Boolean(
-            targetDatabase &&
-            targetDatabase?.kind !== 'page' &&
-            targetDatabase?.blockId &&
-            targetDatabase?.viewId
-        );
 
         let collected = {
             captures: [],
@@ -8408,70 +8521,44 @@ ${pagePayload}
             );
 
             // A selected category page can contain nested Notion pages/toggles
-            // where the actual prompt sets live. The old code kept only the
-            // outer page id, so categories such as 컨셉/배경/NSFW/GPT 프롬프트
-            // were reduced to one shell page and produced 0 prompt sets.
-            // notionNetworkLoadExternalPageSection() only captures this selected
-            // page subtree, so every readable page here belongs to the category.
+            // where the actual prompt sets live. This selected page loader only
+            // captures the category subtree, so keep every readable child page.
             pages = allPages;
-        } else if (isKnownDatabaseSection) {
-            // A selected DB already has collection/view/block ids from root
-            // discovery. Query it directly instead of opening a helper tab and
-            // waiting up to ~2 minutes for intercepted network traffic.
-            collected = await naiNotionWithExternalDbDirectLock(
-                () => notionNetworkLoadExternalDatabaseSectionDirect(
-                    rootUrl,
-                    targetDatabase,
-                    onStatus
-                )
+        } else {
+            // Restore the proven network-intercept path: open the Notion helper
+            // tab, capture its real fetch/XHR API responses, then expand the
+            // captured queryCollection rows before parsing the library.
+            collected = await collectNotionNetworkCaptures(
+                rootUrl,
+                onStatus,
+                targetDatabase
             );
-            captures = Array.isArray(collected?.captures)
+
+            const baseCaptures = Array.isArray(collected?.captures)
                 ? collected.captures
                 : [];
-            pages = Array.isArray(collected?.readablePages)
-                ? collected.readablePages
-                : [];
-        } else {
-            // Whole-source refresh/discovery no longer needs a helper Notion tab.
-            // We already know the root page id from the URL, so load it directly
-            // with Notion's internal API, then walk its linked child pages.
-            onStatus('Notion 분류 구조 직접 확인 중…');
 
-            const deepStructure =
-                await notionNetworkDeepLoadExternalNavigation(
+            const deepStructure = targetDatabase
+                ? { captures: baseCaptures, navigationMeta: new Map() }
+                : await notionNetworkDeepLoadExternalNavigation(
                     rootUrl,
-                    [],
+                    baseCaptures,
                     onStatus
                 );
 
             captures = deepStructure.captures;
-            discoveredDatabases =
-                notionNetworkDiscoverExternalDatabases(
-                    rootUrl,
-                    captures,
-                    null,
-                    deepStructure.navigationMeta
-                );
+            discoveredDatabases = notionNetworkDiscoverExternalDatabases(
+                rootUrl,
+                captures,
+                collected?.queryCollection || null,
+                deepStructure.navigationMeta
+            );
 
-            if (!discoveredDatabases.length) {
-                throw new Error(
-                    'Notion 루트 페이지는 읽었지만 선택 가능한 분류를 찾지 못했습니다.'
-                );
-            }
-
-            // Source-level refresh only needs the category/page map. Prompt
-            // extraction happens when a specific category is synced.
-            return {
-                pageTitle: 'Notion',
-                concepts: [],
-                method: 'notion-direct-discovery',
-                pagesVisited: 0,
-                assetsVisited: captures.length,
-                errors: 0,
-                externalDatabases: discoveredDatabases,
-                activeExternalDatabaseId: '',
-                pageAssets: []
-            };
+            pages =
+                Array.isArray(collected?.readablePages) &&
+                collected.readablePages.length
+                    ? collected.readablePages
+                    : notionNetworkBuildReadablePages(rootUrl, captures);
         }
 
         if (!pages.length) {
@@ -9783,6 +9870,9 @@ ${pagePayload}
                         </div>
                     </section>
                 </div>
+                <div class="nai-loader-scroll-rail" data-library-scroll-rail hidden aria-label="라이브러리 위치 이동">
+                    <div class="nai-loader-scroll-thumb" data-library-scroll-thumb></div>
+                </div>
             </div>
             <div
                 id="nai-loader-toast"
@@ -9797,6 +9887,143 @@ ${pagePayload}
 
         const $ = selector => overlay.querySelector(selector);
         const $$ = selector => [...overlay.querySelectorAll(selector)];
+
+        const modalContent = $('.nai-loader-content');
+        const libraryScrollRail = $('[data-library-scroll-rail]');
+        const libraryScrollThumb = $('[data-library-scroll-thumb]');
+        let libraryScrollTop = Math.max(0, Number(GM_getValue(LIBRARY_SCROLL_KEY, 0)) || 0);
+        let libraryScrollDrag = null;
+        let libraryScrollUpdateFrame = 0;
+
+        function updateLibraryScrollRail() {
+            if (!modalContent || !libraryScrollRail || !libraryScrollThumb) return;
+            if (activeTab !== 'library') {
+                libraryScrollRail.hidden = true;
+                return;
+            }
+
+            const viewport = modalContent.clientHeight;
+            const total = modalContent.scrollHeight;
+            const maxScroll = Math.max(0, total - viewport);
+            if (viewport <= 0 || maxScroll <= 1) {
+                libraryScrollRail.hidden = true;
+                return;
+            }
+
+            libraryScrollRail.hidden = false;
+            const railHeight = libraryScrollRail.clientHeight;
+            const thumbHeight = Math.max(34, Math.min(railHeight, railHeight * (viewport / total)));
+            const travel = Math.max(0, railHeight - thumbHeight);
+            const ratio = maxScroll ? Math.min(1, Math.max(0, modalContent.scrollTop / maxScroll)) : 0;
+            libraryScrollThumb.style.height = `${thumbHeight}px`;
+            libraryScrollThumb.style.transform = `translateY(${travel * ratio}px)`;
+        }
+
+        function queueLibraryScrollRailUpdate() {
+            if (libraryScrollUpdateFrame) cancelAnimationFrame(libraryScrollUpdateFrame);
+            libraryScrollUpdateFrame = requestAnimationFrame(() => {
+                libraryScrollUpdateFrame = 0;
+                updateLibraryScrollRail();
+            });
+        }
+
+        function captureLibraryScrollPosition({ persist = false } = {}) {
+            if (!modalContent) return;
+            if (activeTab === 'library') {
+                libraryScrollTop = Math.max(0, modalContent.scrollTop || 0);
+            }
+            if (persist) GM_setValue(LIBRARY_SCROLL_KEY, libraryScrollTop);
+        }
+
+        function restoreLibraryScrollPosition() {
+            if (!modalContent || activeTab !== 'library') return;
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (!modalContent.isConnected || activeTab !== 'library') return;
+                    const maxScroll = Math.max(0, modalContent.scrollHeight - modalContent.clientHeight);
+                    modalContent.scrollTop = Math.min(maxScroll, Math.max(0, libraryScrollTop));
+                    updateLibraryScrollRail();
+                });
+            });
+        }
+
+        const libraryScrollMutationObserver = new MutationObserver(queueLibraryScrollRailUpdate);
+        if (modalContent) {
+            libraryScrollMutationObserver.observe(modalContent, { childList: true, subtree: true, attributes: true });
+            modalContent.addEventListener('scroll', () => {
+                if (activeTab === 'library') libraryScrollTop = Math.max(0, modalContent.scrollTop || 0);
+                queueLibraryScrollRailUpdate();
+            }, { passive: true });
+        }
+
+        const libraryScrollResizeObserver = typeof ResizeObserver === 'function'
+            ? new ResizeObserver(queueLibraryScrollRailUpdate)
+            : null;
+        if (libraryScrollResizeObserver && modalContent) libraryScrollResizeObserver.observe(modalContent);
+
+        function setLibraryScrollFromRail(clientY, centerThumb = false) {
+            if (!modalContent || !libraryScrollRail || !libraryScrollThumb || libraryScrollRail.hidden) return;
+            const railRect = libraryScrollRail.getBoundingClientRect();
+            const thumbHeight = libraryScrollThumb.offsetHeight;
+            const travel = Math.max(0, railRect.height - thumbHeight);
+            const maxScroll = Math.max(0, modalContent.scrollHeight - modalContent.clientHeight);
+            if (!travel || !maxScroll) return;
+            let y = clientY - railRect.top;
+            if (centerThumb) y -= thumbHeight / 2;
+            const thumbTop = Math.min(travel, Math.max(0, y));
+            modalContent.scrollTop = (thumbTop / travel) * maxScroll;
+        }
+
+        libraryScrollRail?.addEventListener('pointerdown', event => {
+            if (activeTab !== 'library' || libraryScrollRail.hidden) return;
+            event.preventDefault();
+            const onThumb = event.target.closest('[data-library-scroll-thumb]');
+            if (!onThumb) {
+                setLibraryScrollFromRail(event.clientY, true);
+                queueLibraryScrollRailUpdate();
+                return;
+            }
+            libraryScrollDrag = {
+                pointerId: event.pointerId,
+                startY: event.clientY,
+                startScrollTop: modalContent.scrollTop
+            };
+            libraryScrollThumb.classList.add('dragging');
+            try { libraryScrollRail.setPointerCapture?.(event.pointerId); } catch (_) {}
+        });
+
+        libraryScrollRail?.addEventListener('pointermove', event => {
+            if (!libraryScrollDrag || event.pointerId !== libraryScrollDrag.pointerId) return;
+            event.preventDefault();
+            const railHeight = libraryScrollRail.clientHeight;
+            const thumbHeight = libraryScrollThumb.offsetHeight;
+            const travel = Math.max(1, railHeight - thumbHeight);
+            const maxScroll = Math.max(0, modalContent.scrollHeight - modalContent.clientHeight);
+            modalContent.scrollTop = libraryScrollDrag.startScrollTop +
+                ((event.clientY - libraryScrollDrag.startY) / travel) * maxScroll;
+        });
+
+        function finishLibraryScrollDrag(event) {
+            if (!libraryScrollDrag || (event && event.pointerId !== libraryScrollDrag.pointerId)) return;
+            const pointerId = libraryScrollDrag.pointerId;
+            libraryScrollDrag = null;
+            libraryScrollThumb?.classList.remove('dragging');
+            try {
+                if (libraryScrollRail?.hasPointerCapture?.(pointerId)) libraryScrollRail.releasePointerCapture(pointerId);
+            } catch (_) {}
+            captureLibraryScrollPosition();
+        }
+
+        libraryScrollRail?.addEventListener('pointerup', finishLibraryScrollDrag);
+        libraryScrollRail?.addEventListener('pointercancel', finishLibraryScrollDrag);
+
+        function closeArchiveModal() {
+            captureLibraryScrollPosition({ persist: true });
+            if (libraryScrollUpdateFrame) cancelAnimationFrame(libraryScrollUpdateFrame);
+            libraryScrollMutationObserver.disconnect();
+            libraryScrollResizeObserver?.disconnect();
+            overlay.remove();
+        }
 
         let toastHideTimer = null;
         let toastSerial = 0;
@@ -9865,11 +10092,15 @@ ${pagePayload}
         }
 
         function switchTab(tab) {
+            if (activeTab === 'library' && tab !== 'library') {
+                captureLibraryScrollPosition();
+            }
             if (activeTab === 'library' && libraryCreateOpen && tab !== 'library') {
                 syncManualDraftFromDom();
             }
 
             activeTab = tab;
+            modalContent?.classList.toggle('nai-library-scroll-mode', tab === 'library');
 
             $$('.nai-loader-tab').forEach(button => {
                 button.classList.toggle(
@@ -9905,6 +10136,9 @@ ${pagePayload}
                 renderBackupSelection();
                 renderRestorePreview();
             }
+
+            if (tab === 'library') restoreLibraryScrollPosition();
+            else queueLibraryScrollRailUpdate();
         }
 
         function backupKindItems(kind) {
@@ -13746,7 +13980,7 @@ ${pagePayload}
 
         $('[data-action="close"]').addEventListener(
             'click',
-            () => overlay.remove()
+            closeArchiveModal
         );
 
         function setAllAnalysisSelection(selected) {
@@ -14586,7 +14820,7 @@ ${pagePayload}
 
         overlay.addEventListener('mousedown', event => {
             if (event.target === overlay) {
-                overlay.remove();
+                closeArchiveModal();
             }
         });
 
@@ -14602,7 +14836,7 @@ ${pagePayload}
                 }
 
                 if (event.key === 'Escape') {
-                    overlay.remove();
+                    closeArchiveModal();
                     document.removeEventListener(
                         'keydown',
                         onKeydown
@@ -14643,6 +14877,7 @@ ${pagePayload}
         renderAnalysisResults();
         syncGlobalAnalyzeUi();
         switchTab(activeTab);
+        restoreLibraryScrollPosition();
     }
 
     /* =====================================================================
@@ -20128,7 +20363,17 @@ ${pagePayload}
                         if(type==='add'){
                             const created=await naiNotionAddExternalModal();
                             if(created){created.databases=[];created.selectedDatabaseId='';sources.push(created);naiNotionSaveExternalSources(sources);naiNotionState.externalSourceId=created.id;naiNotionController.renderLibraryPanel();naiNotionSyncExternalSource(created.id);}
-                        } else if(type==='sync'&&source) naiNotionSyncExternalSource(id);
+                        } else if(type==='sync'&&source){
+                            const refreshed=await naiNotionSyncExternalSource(id,'',{suppressRender:true});
+                            if(refreshed?.ok){
+                                const latest=refreshed.source || naiNotionGetExternalSources().find(x=>x.id===id);
+                                const targetDbId=String(latest?.selectedDatabaseId || latest?.databases?.[0]?.id || '');
+                                if(targetDbId) await naiNotionSyncExternalSource(id,targetDbId);
+                                else naiNotionController.renderLibraryPanel();
+                            }else{
+                                naiNotionController.renderLibraryPanel();
+                            }
+                        }
                         else if(type==='sync-db'&&source&&dbId) naiNotionSyncExternalSource(id,dbId);
                         else if(type==='choose-db'&&source){
                             const chosen=await naiNotionExternalDatabaseModal(source);
@@ -20331,5 +20576,3 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
 
     injectNavbarButton();
 })();
-
-    
