@@ -1,7 +1,7 @@
     // ==UserScript==
 // @name         NAI Archive
 // @namespace    https://github.com/Dflashh/
-// @version      1.0.21
+// @version      1.0.31
 // @description  NovelAI 컨셉·자료·메모를 한곳에 보관하고 공유하는 개인 아카이브입니다.
 // @icon         https://cdn.jsdelivr.net/gh/Dflashh/Nai@main/Icon/NaiA.webp
 // @downloadURL  https://raw.githubusercontent.com/mynameislovesong/NAIA/main/NaiA_v2.user.js
@@ -32,7 +32,7 @@
     'use strict';
 
     const APP_NAME = 'NAI Archive';
-    const APP_VERSION = '1.0.21';
+    const APP_VERSION = '1.0.31';
     const BUTTON_ID = 'nai-concept-loader-button';
     const MODAL_ID = 'nai-concept-loader-modal';
     const SETTINGS_KEY = 'naiConceptLoader.settings';
@@ -383,6 +383,7 @@
 
         .nai-loader-content.nai-library-scroll-mode {
             scrollbar-width: none;
+            overflow-x: hidden;
         }
 
         .nai-loader-content.nai-library-scroll-mode::-webkit-scrollbar {
@@ -860,10 +861,14 @@
 
         .nai-library-list {
             display: grid;
+            grid-template-columns: minmax(0, 1fr);
             gap: 10px;
             align-items: start;
             align-content: start;
             grid-auto-rows: max-content;
+            min-width: 0;
+            max-width: 100%;
+            overflow-x: hidden;
         }
 
         .nai-library-empty {
@@ -4901,6 +4906,149 @@
         };
     }
 
+    function naiFirebaseAiErrorDetails(error) {
+        const message = String(error?.message || error || '').trim();
+        const code = String(
+            error?.code ||
+            error?.customData?.code ||
+            error?.cause?.code ||
+            ''
+        ).trim();
+        const directStatus = [
+            error?.status,
+            error?.statusCode,
+            error?.customData?.status,
+            error?.customData?.statusCode,
+            error?.response?.status,
+            error?.cause?.status,
+            error?.cause?.statusCode
+        ].map(Number).find(value => Number.isInteger(value) && value >= 400 && value <= 599);
+        const statusMatch = message.match(
+            /(?:HTTP\s*|\[\s*)(4\d\d|5\d\d)(?:\s*\]|\b)/i
+        );
+        const endpointMatch = message.match(/https?:\/\/[^\s)\]]+/i);
+        return {
+            code,
+            status: directStatus || Number(statusMatch?.[1] || 0) || 0,
+            message,
+            endpoint: endpointMatch?.[0] || ''
+        };
+    }
+
+    function isRetryableFirebaseAiError(error) {
+        const details = naiFirebaseAiErrorDetails(error);
+        if ([400, 401, 403, 404, 409, 422, 429].includes(details.status)) {
+            return false;
+        }
+        if ([500, 502, 503, 504].includes(details.status)) return true;
+
+        const combined = `${details.code}\n${details.message}`;
+        if (
+            /permission[-_ ]?denied|unauthenticated|authentication|invalid[-_ ]?(?:argument|api|config)|api[-_ ]?key|quota|resource[-_ ]?exhausted/i.test(
+                combined
+            )
+        ) {
+            return false;
+        }
+        return /Failed to fetch|Error fetching from|AI\/fetch-error|network error|network request failed|timeout|timed out|타임아웃|ECONNRESET|temporar(?:y|ily)/i.test(
+            combined
+        );
+    }
+
+    async function naiFirebaseGenerateContentWithRetry(
+        generateContent,
+        {
+            maxAttempts = 3,
+            baseDelay = 1000,
+            wait = waitMs
+        } = {}
+    ) {
+        let lastError = null;
+        const attempts = Math.max(1, Number(maxAttempts) || 3);
+
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                return await generateContent();
+            } catch (error) {
+                lastError = error;
+                const details = naiFirebaseAiErrorDetails(error);
+                const retryable = isRetryableFirebaseAiError(error);
+
+                if (!retryable || attempt >= attempts) {
+                    if (retryable) {
+                        console.error(
+                            '[NAIA AI] batch failed after retries',
+                            {
+                                attempt,
+                                code: details.code,
+                                status: details.status,
+                                message: details.message,
+                                endpoint: details.endpoint
+                            },
+                            error
+                        );
+                    } else {
+                        console.error(
+                            '[NAIA AI] non-retryable Firebase error',
+                            {
+                                attempt,
+                                code: details.code,
+                                status: details.status,
+                                message: details.message,
+                                endpoint: details.endpoint
+                            },
+                            error
+                        );
+                    }
+                    throw error;
+                }
+
+                console.warn(
+                    '[NAIA AI] retryable Firebase error',
+                    {
+                        attempt,
+                        code: details.code,
+                        status: details.status,
+                        message: details.message,
+                        endpoint: details.endpoint
+                    },
+                    error
+                );
+                await wait(baseDelay * (2 ** (attempt - 1)));
+            }
+        }
+
+        throw lastError || new Error('Firebase AI 요청이 실패했습니다.');
+    }
+
+    function naiFirebaseAiFailureSummary(error) {
+        const details = naiFirebaseAiErrorDetails(error);
+        const internal = details.message.match(/Internal error encountered\.?/i)?.[0] || '';
+        const reason = internal || details.message || details.code || '알 수 없는 오류';
+        return [
+            'Firebase AI',
+            details.status ? `HTTP ${details.status}` : '',
+            reason
+        ].filter(Boolean).join(' · ');
+    }
+
+    function naiNotionClassifyAiBatchOutcome({
+        conceptCount = 0,
+        batchCount = 0,
+        errorCount = 0,
+        successfulBatchCount = 0
+    } = {}) {
+        if (Number(conceptCount) > 0) return 'success';
+        if (
+            Number(batchCount) > 0 &&
+            Number(successfulBatchCount) === 0 &&
+            Number(errorCount) === Number(batchCount)
+        ) {
+            return 'failure';
+        }
+        return 'empty';
+    }
+
     async function callFirebase(prompt, settings, options = {}) {
         const config = parseFirebaseConfig(settings.firebaseConfig);
 
@@ -4966,11 +5114,8 @@
             firebaseModelCache[modelKey] = model;
         }
 
-        let result;
-        let lastError = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                result = await Promise.race([
+        const result = await naiFirebaseGenerateContentWithRetry(
+            () => Promise.race([
                     model.generateContent(String(prompt || '')),
                     new Promise((_, reject) => {
                         setTimeout(
@@ -4978,28 +5123,8 @@
                             90000
                         );
                     })
-                ]);
-                lastError = null;
-                break;
-            } catch (error) {
-                lastError = error;
-                const message = String(error?.message || error || '');
-                if (!/Failed to fetch/i.test(message) || attempt >= 1) break;
-                await waitMs(1200);
-            }
-        }
-
-        if (lastError) {
-            const message = String(lastError?.message || lastError || '');
-            if (/Failed to fetch/i.test(message)) {
-                throw new Error(
-                    'Firebase AI Logic 네트워크 요청이 2회 연속 실패했습니다. ' +
-                    '모델/Prompt 문제가 아니라 브라우저에서 Firebase AI 엔드포인트 응답을 받지 못한 오류입니다. ' +
-                    'Firebase AI 설정, 브라우저 확장 차단, 네트워크 상태를 확인해주세요.'
-                );
-            }
-            throw lastError;
-        }
+                ])
+        );
 
         const text = result?.response?.text?.() || '';
 
@@ -5539,6 +5664,14 @@ ${sourcePart}
                         : {}),
                     ...notionNetworkExtractPropertyNames(parsed)
                 };
+                const titlePropertyIds = [
+                    ...new Set([
+                        ...(Array.isArray(queryCollection?.titlePropertyIds)
+                            ? queryCollection.titlePropertyIds
+                            : []),
+                        ...notionNetworkExtractTitlePropertyIds(parsed)
+                    ])
+                ];
 
                 queryCollection = {
                     ...(queryCollection || {}),
@@ -5553,13 +5686,15 @@ ${sourcePart}
                     // real response these records already contain each row's
                     // child `content` ids even though the child blocks are not
                     // present yet.
-                    rowRecords: Object.values(previousRows).slice(0, 500),
+                    rowRecords: Object.values(previousRows).slice(0, 1000),
                     propertyNames,
+                    titlePropertyIds,
                     imagePropertyIds,
                     rowImageRefs,
                     hasMore: Boolean(group?.hasMore),
                     sizeHint: Math.max(
                         Number(queryCollection?.sizeHint || 0),
+                        Number(group?.sizeHint || 0),
                         Number(parsed?.result?.sizeHint || 0),
                         mergedIds.length
                     ),
@@ -5911,6 +6046,43 @@ ${sourcePart}
         return names;
     }
 
+    function notionNetworkExtractTitlePropertyIds(parsed) {
+        const ids = [];
+        const collectionMap = parsed?.recordMap?.collection;
+        if (!collectionMap || typeof collectionMap !== 'object') return ids;
+
+        for (const record of Object.values(collectionMap)) {
+            const value = notionNetworkUnwrapRecord(record);
+            const schema = value?.schema;
+            if (!schema || typeof schema !== 'object') continue;
+            for (const [propertyId, definition] of Object.entries(schema)) {
+                if (String(definition?.type || '').trim().toLowerCase() === 'title') {
+                    ids.push(propertyId);
+                }
+            }
+        }
+
+        return [...new Set(ids)];
+    }
+
+    function notionNetworkRowTitle(row, titlePropertyIds = []) {
+        const properties = row?.properties;
+        if (!properties || typeof properties !== 'object') return '';
+
+        const candidates = [
+            ...(Array.isArray(titlePropertyIds) ? titlePropertyIds : []),
+            'title'
+        ];
+        for (const propertyId of [...new Set(candidates.filter(Boolean))]) {
+            if (!Object.prototype.hasOwnProperty.call(properties, propertyId)) continue;
+            const title = notionNetworkInternalRichTextToPlain(
+                properties[propertyId]
+            ).trim();
+            if (title) return title;
+        }
+        return '';
+    }
+
     function notionNetworkExtractImagePropertyIds(parsed) {
         const ids = [];
         const collectionMap = parsed?.recordMap?.collection;
@@ -5948,7 +6120,11 @@ ${sourcePart}
         return notionNetworkFindAttachmentRef(props);
     }
 
-    function notionNetworkSyntheticCapture(blockRecords, propertyNames = {}) {
+    function notionNetworkSyntheticCapture(
+        blockRecords,
+        propertyNames = {},
+        titlePropertyIds = []
+    ) {
         const block = {};
         for (const [id, value] of Object.entries(blockRecords || {})) {
             if (!value || typeof value !== 'object') continue;
@@ -5960,8 +6136,14 @@ ${sourcePart}
         }
 
         const schema = {};
+        const titleIds = new Set(
+            Array.isArray(titlePropertyIds) ? titlePropertyIds : []
+        );
         for (const [id, name] of Object.entries(propertyNames || {})) {
-            schema[id] = { name };
+            schema[id] = {
+                name,
+                ...(titleIds.has(id) ? { type: 'title' } : {})
+            };
         }
 
         const recordMap = { block };
@@ -6128,6 +6310,13 @@ ${sourcePart}
                 ? queryState.propertyNames
                 : {})
         };
+        let titlePropertyIds = [
+            ...new Set(
+                Array.isArray(queryState?.titlePropertyIds)
+                    ? queryState.titlePropertyIds
+                    : []
+            )
+        ];
         const rowImageRefs = {
             ...(queryState?.rowImageRefs && typeof queryState.rowImageRefs === 'object'
                 ? queryState.rowImageRefs
@@ -6159,6 +6348,12 @@ ${sourcePart}
                 notionNetworkExtractCompactBlocks(parsed)
             );
             Object.assign(propertyNames, notionNetworkExtractPropertyNames(parsed));
+            titlePropertyIds = [
+                ...new Set([
+                    ...titlePropertyIds,
+                    ...notionNetworkExtractTitlePropertyIds(parsed)
+                ])
+            ];
         }
 
         const rowIds = new Set(
@@ -6182,6 +6377,7 @@ ${sourcePart}
 
         let sizeHint = Math.max(Number(queryState?.sizeHint || 0), rowIds.size);
         let fullQueryWorked = false;
+        let rowListRetryRequest = null;
 
         const mergeQueryResult = resultData => {
             if (!resultData || typeof resultData !== 'object') return 0;
@@ -6216,6 +6412,12 @@ ${sourcePart}
 
             notionNetworkMergeCompactBlocks(blockRecords, incoming);
             Object.assign(propertyNames, notionNetworkExtractPropertyNames(resultData));
+            titlePropertyIds = [
+                ...new Set([
+                    ...titlePropertyIds,
+                    ...notionNetworkExtractTitlePropertyIds(resultData)
+                ])
+            ];
             sizeHint = Math.max(
                 sizeHint,
                 Number(resultData?.result?.sizeHint || 0),
@@ -6292,6 +6494,11 @@ ${sourcePart}
                         `Notion DB row 목록 확인 중… ${rowIds.size}` +
                         (sizeHint ? `/${sizeHint}` : '')
                 });
+                rowListRetryRequest = {
+                    endpoint: `${origin}/api/v3/queryCollection?src=initial_load`,
+                    payload: cloneJson(payload) || payload,
+                    context: 'queryCollection expanded retry'
+                };
                 try {
                     const result = await notionNetworkGmPostJson(
                         `${origin}/api/v3/queryCollection?src=initial_load`,
@@ -6405,6 +6612,11 @@ ${sourcePart}
                             `${rowIds.size}${sizeHint ? `/${sizeHint}` : ''}`
                     });
 
+                    rowListRetryRequest = {
+                        endpoint: `${origin}/api/v3/queryCollection?src=initial_load`,
+                        payload: cloneJson(expandedPayload) || expandedPayload,
+                        context: 'queryCollection selected external DB expanded retry'
+                    };
                     try {
                         const expandedResult = await notionNetworkGmPostJson(
                             `${origin}/api/v3/queryCollection?src=initial_load`,
@@ -6486,7 +6698,81 @@ ${sourcePart}
             }
         }
 
-        const pageIds = [...rowIds].filter(Boolean).slice(0, 500);
+        // Treat the database card count as the source of truth. If Notion told
+        // us there are more cards than row IDs currently recovered, retry only
+        // the row-list request before touching row bodies.
+        if (sizeHint && rowIds.size < sizeHint && rowListRetryRequest) {
+            for (let attempt = 1; attempt <= 3 && rowIds.size < sizeHint; attempt++) {
+                const before = rowIds.size;
+                notionCrawlerJobWrite({
+                    ...(notionCrawlerJobRead() || job),
+                    message:
+                        `Notion 카드 목록 누락 확인 · ${rowIds.size}/${sizeHint} · ` +
+                        `목록 재시도 ${attempt}/3`
+                });
+                try {
+                    const retryResult = await notionNetworkGmPostJson(
+                        rowListRetryRequest.endpoint,
+                        cloneJson(rowListRetryRequest.payload) || rowListRetryRequest.payload,
+                        rowListRetryRequest.context
+                    );
+                    mergeQueryResult(retryResult?.data);
+                } catch (error) {
+                    console.warn(`[${APP_NAME}] row-list verification retry skipped`, error);
+                }
+                if (rowIds.size >= sizeHint) break;
+                if (rowIds.size === before) await sleepMs(500 * attempt);
+            }
+        }
+
+        const expectedRowCount = Math.max(Number(sizeHint || 0), rowIds.size);
+        const pageIds = [...rowIds].filter(Boolean).slice(0, 1000);
+        const cachedRowIds = new Set(
+            Array.isArray(targetDatabase?.cachedRowIds)
+                ? targetDatabase.cachedRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const cachedNonPromptRowIds = new Set(
+            Array.isArray(targetDatabase?.cachedNonPromptRowIds)
+                ? targetDatabase.cachedNonPromptRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const cachedExpectedRowIds = new Set(
+            pageIds.filter(id => cachedRowIds.has(id))
+        );
+        const cachedExpectedNonPromptRowIds = new Set(
+            pageIds.filter(id => cachedNonPromptRowIds.has(id))
+        );
+        // Incremental re-sync: rows already present in the local external-library
+        // cache, including rows already resolved as non-Prompt, do not need
+        // their body downloaded again. Failed/unresolved rows remain fetchable.
+        const fetchPageIds = targetDatabase
+            ? naiNotionExternalFetchPageIds(
+                pageIds,
+                [...cachedExpectedRowIds],
+                [...cachedExpectedNonPromptRowIds]
+            )
+            : [...pageIds];
+        const unknownRowIdMissingCount = Math.max(
+            0,
+            expectedRowCount - pageIds.length
+        );
+        const rowListComplete =
+            unknownRowIdMissingCount === 0 &&
+            pageIds.length >= expectedRowCount;
+        const deletedRowIds = rowListComplete
+            ? [...new Set([...cachedRowIds, ...cachedNonPromptRowIds])]
+                .filter(id => !rowIds.has(id))
+            : [];
+        console.info(
+            '[NAIA Sync]\n' +
+            `remote row ids: ${pageIds.length}\n` +
+            `cached row ids: ${cachedExpectedRowIds.size}\n` +
+            `cached non-prompt row ids: ${cachedExpectedNonPromptRowIds.size}\n` +
+            `new ids: ${fetchPageIds.length}\n` +
+            `missing ids: ${fetchPageIds.length + unknownRowIdMissingCount}\n` +
+            `deleted ids: ${deletedRowIds.length}`
+        );
         if (!pageIds.length) {
             const readablePages = notionNetworkBuildReadablePages(
                 job.rootUrl || location.href,
@@ -6511,10 +6797,12 @@ ${sourcePart}
         // cannot stall the whole external-library sync indefinitely.
         notionCrawlerJobWrite({
             ...(notionCrawlerJobRead() || job),
-            message:
-                `Notion row 본문 내부 API 조회 준비 · ${pageIds.length}` +
-                (sizeHint ? `/${sizeHint}` : '') +
-                `개`
+            message: targetDatabase
+                ? `Notion 증분 동기화 준비 · 전체 ${expectedRowCount || pageIds.length}개 · ` +
+                  `기존 ${cachedExpectedRowIds.size}개 · 불러올 카드 ${fetchPageIds.length}개`
+                : `Notion row 본문 내부 API 조회 준비 · ${pageIds.length}` +
+                  (sizeHint ? `/${sizeHint}` : '') +
+                  `개`
         });
 
         let completed = 0;
@@ -6522,6 +6810,12 @@ ${sourcePart}
         let retryCount = 0;
         let cursor = 0;
         const failedRows = new Set();
+        // Cached rows count as already verified locally. Newly fetched rows are
+        // added to this same set, so final verification is against the union.
+        const loadedRowIds = new Set([
+            ...cachedExpectedRowIds,
+            ...cachedExpectedNonPromptRowIds
+        ]);
         const readableByKey = new Map();
 
         const attachExactRowImages = pages => {
@@ -6557,13 +6851,21 @@ ${sourcePart}
             }
         };
 
-        // Preserve row titles/properties already recovered from queryCollection.
-        if (Object.keys(blockRecords).length) {
-            mergeReadablePages([
-                notionNetworkSyntheticCapture(blockRecords, propertyNames)
-            ]);
+        // On a targeted incremental sync, cached cards are intentionally not
+        // parsed again. The queryCollection record map is still used for row-ID
+        // verification, but only freshly fetched/missing rows are sent onward.
+        if (!targetDatabase) {
+            if (Object.keys(blockRecords).length) {
+                mergeReadablePages([
+                    notionNetworkSyntheticCapture(
+                        blockRecords,
+                        propertyNames,
+                        titlePropertyIds
+                    )
+                ]);
+            }
+            mergeReadablePages(initialCaptures);
         }
-        mergeReadablePages(initialCaptures);
 
         const loadPageChunkWithRetry = async (pageId, payload, chunkNumber) => {
             let lastError = null;
@@ -6583,7 +6885,7 @@ ${sourcePart}
                         ...(notionCrawlerJobRead() || job),
                         message:
                             `Notion row 본문 재시도 중… ` +
-                            `${completed}/${pageIds.length} · ` +
+                            `${completed}/${fetchPageIds.length} · ` +
                             `재시도 ${attempt + 1}/${maxAttempts}`
                     });
                     await sleepMs(450 * attempt);
@@ -6597,6 +6899,7 @@ ${sourcePart}
         const fetchPage = async pageId => {
             const pageCaptures = [];
             let cursorState = { stack: [] };
+            let rowComplete = true;
 
             for (let chunkNumber = 0; chunkNumber < 4; chunkNumber++) {
                 const payload = {
@@ -6615,6 +6918,7 @@ ${sourcePart}
                         chunkNumber
                     );
                 } catch (error) {
+                    rowComplete = false;
                     failedRows.add(pageId);
                     console.warn(
                         `[${APP_NAME}] public Notion page chunk failed after retry`,
@@ -6625,6 +6929,14 @@ ${sourcePart}
                 }
 
                 successful += 1;
+                const activeJob = notionCrawlerJobRead();
+                if (activeJob?.status === 'running') {
+                    notionCrawlerJobWrite({
+                        ...activeJob,
+                        lastApiResponseAt: Date.now(),
+                        lastRowId: pageId
+                    });
+                }
                 pageCaptures.push({
                     url: result.url || '',
                     method: 'POST',
@@ -6645,25 +6957,40 @@ ${sourcePart}
             }
 
             if (pageCaptures.length) mergeReadablePages(pageCaptures);
+            if (rowComplete && pageCaptures.length) {
+                loadedRowIds.add(pageId);
+                failedRows.delete(pageId);
+                const activeJob = notionCrawlerJobRead();
+                if (activeJob?.status === 'running') {
+                    notionCrawlerJobWrite({
+                        ...activeJob,
+                        lastRowCompletedAt: Date.now(),
+                        lastRowId: pageId
+                    });
+                }
+                return true;
+            }
+            return false;
         };
 
-        const workerCount = Math.min(5, Math.max(1, pageIds.length));
+        const workerCount = Math.min(5, Math.max(1, fetchPageIds.length));
         const worker = async () => {
             while (true) {
                 const index = cursor++;
-                if (index >= pageIds.length) return;
+                if (index >= fetchPageIds.length) return;
 
-                await fetchPage(pageIds[index]);
+                await fetchPage(fetchPageIds[index]);
                 completed += 1;
 
-                if (completed % 5 === 0 || completed === pageIds.length) {
+                if (completed % 5 === 0 || completed === fetchPageIds.length) {
                     const current = notionCrawlerJobRead();
                     if (!current || current.status !== 'running') return;
                     notionCrawlerJobWrite({
                         ...current,
                         message:
-                            `Notion row 본문 내부 API 조회 중… ` +
-                            `${completed}/${pageIds.length}` +
+                            `Notion 증분 본문 조회 중… ` +
+                            `${completed}/${fetchPageIds.length}` +
+                            ` · 전체 확보 ${loadedRowIds.size}/${expectedRowCount || pageIds.length}` +
                             (retryCount ? ` · 재시도 ${retryCount}회` : '') +
                             (failedRows.size ? ` · 실패 ${failedRows.size}개` : '')
                     });
@@ -6671,38 +6998,67 @@ ${sourcePart}
             }
         };
 
-        await Promise.all(
-            Array.from({ length: workerCount }, () => worker())
-        );
-
-        // Give rows that exhausted their first three attempts one final pass.
-        // This is deliberately row-level, not recursive child-block batching.
-        if (failedRows.size) {
-            const finalRetryIds = [...failedRows];
-            failedRows.clear();
-            notionCrawlerJobWrite({
-                ...(notionCrawlerJobRead() || job),
-                message: `Notion row 최종 재시도 중… ${finalRetryIds.length}개`
-            });
-            for (let i = 0; i < finalRetryIds.length; i++) {
-                await fetchPage(finalRetryIds[i]);
-                if ((i + 1) % 5 === 0 || i + 1 === finalRetryIds.length) {
-                    notionCrawlerJobWrite({
-                        ...(notionCrawlerJobRead() || job),
-                        message:
-                            `Notion row 최종 재시도 중… ` +
-                            `${i + 1}/${finalRetryIds.length}` +
-                            (failedRows.size ? ` · 남은 실패 ${failedRows.size}개` : '')
-                    });
-                }
-            }
+        if (fetchPageIds.length) {
+            await Promise.all(
+                Array.from({ length: workerCount }, () => worker())
+            );
         }
 
+        // Verify by row ID only after the first incremental pass, then retry
+        // exactly the cards that are still absent from both cache and fetch.
+        for (const pageId of fetchPageIds) {
+            if (!loadedRowIds.has(pageId)) failedRows.add(pageId);
+        }
+
+        // loadPageChunkWithRetry already gives the failed row its maximum three
+        // attempts. Do not run a second three-attempt pass here: that made one
+        // row receive up to six requests and delayed every other missing row.
+        // Remaining IDs stay missing and are the only IDs fetched next sync.
+
+        const missingRowIds = pageIds.filter(id => !loadedRowIds.has(id));
+        const finalMissingCount = missingRowIds.length + unknownRowIdMissingCount;
+        const verifiedLoadedCount = Math.max(
+            0,
+            (expectedRowCount || pageIds.length) - finalMissingCount
+        );
+        const rowTitles = {};
+        for (const pageId of pageIds) {
+            const block = blockRecords[pageId];
+            const title = notionNetworkRowTitle(block, titlePropertyIds);
+            if (title) rowTitles[pageId] = title;
+        }
+
+        const rowVerification = {
+            expectedCount: expectedRowCount || pageIds.length,
+            expectedRowIds: pageIds,
+            rowTitles,
+            rowIdCount: pageIds.length,
+            rowListComplete,
+            deletedRowIds,
+            cachedRowIds: [...cachedExpectedRowIds],
+            cachedCount: cachedExpectedRowIds.size,
+            cachedNonPromptRowIds: [...cachedExpectedNonPromptRowIds],
+            cachedNonPromptCount: cachedExpectedNonPromptRowIds.size,
+            requestedFetchRowIds: fetchPageIds,
+            requestedFetchCount: fetchPageIds.length,
+            loadedFetchRowIds: fetchPageIds.filter(id => loadedRowIds.has(id)),
+            failedRowIds: [...failedRows],
+            loadedCount: loadedRowIds.size,
+            verifiedLoadedCount,
+            missingRowIds,
+            unknownMissingCount: unknownRowIdMissingCount,
+            missingCount: finalMissingCount,
+            complete: finalMissingCount === 0
+        };
+
+        const fetchPageIdSet = new Set(fetchPageIds);
         const readablePages = attachExactRowImages(
             [...readableByKey.values()]
         ).filter(page => {
             const text = String(page?.text || '').trim();
-            return text.length >= 20;
+            if (!text) return false;
+            if (!targetDatabase) return true;
+            return fetchPageIdSet.has(String(page?.id || ''));
         });
 
         job = notionCrawlerJobRead();
@@ -6714,18 +7070,23 @@ ${sourcePart}
                 queryCollection: {
                     ...(job.queryCollection || {}),
                     blockIds: pageIds,
-                    sizeHint,
+                    sizeHint: expectedRowCount,
+                    titlePropertyIds,
                     imagePropertyIds,
                     rowImageRefs,
-                    expandedAllRows: fullQueryWorked && (!sizeHint || pageIds.length >= sizeHint)
+                    expandedAllRows: rowVerification.complete
                 },
+                rowVerification,
                 message:
-                    `Notion 내부 API 확장 완료 · row ${pageIds.length}` +
-                    (sizeHint ? `/${sizeHint}` : '') +
-                    ` · 본문 응답 ${successful}개` +
+                    `Notion 카드 검증 완료 · ${verifiedLoadedCount}/${rowVerification.expectedCount}` +
+                    (targetDatabase
+                        ? ` · 기존 ${cachedExpectedRowIds.size}개 · 신규/누락 조회 ${fetchPageIds.length}개`
+                        : '') +
+                    (rowVerification.missingCount
+                        ? ` · 누락 ${rowVerification.missingCount}개`
+                        : ' · 누락 없음') +
                     ` · 복원 ${readablePages.length}개` +
                     (retryCount ? ` · 재시도 ${retryCount}회` : '') +
-                    (failedRows.size ? ` · 최종 실패 ${failedRows.size}개` : '') +
                     ` · 이미지 ${readablePages.filter(page => page?.imageUrl).length}개`
             });
         }
@@ -6733,7 +7094,8 @@ ${sourcePart}
         return {
             rows: pageIds.length,
             pageChunks: successful,
-            readablePages
+            readablePages,
+            rowVerification
         };
     }
 
@@ -6773,6 +7135,7 @@ ${sourcePart}
     function notionNetworkBuildReadablePages(rootUrl, captures) {
         const blocks = new Map();
         const propertyNames = new Map();
+        const titlePropertyIds = new Set();
 
         for (const capture of captures || []) {
             const parsed = notionNetworkParseJson(capture?.responseText);
@@ -6787,6 +7150,9 @@ ${sourcePart}
                     for (const [propertyId, definition] of Object.entries(schema)) {
                         const name = String(definition?.name || definition?.id || propertyId || '').trim();
                         if (name) propertyNames.set(propertyId, name);
+                        if (String(definition?.type || '').trim().toLowerCase() === 'title') {
+                            titlePropertyIds.add(propertyId);
+                        }
                     }
                 }
             }
@@ -6832,6 +7198,10 @@ ${sourcePart}
                 ''
             );
         };
+        const pageTitle = page =>
+            notionNetworkRowTitle(page, [...titlePropertyIds]) ||
+            blockText(page) ||
+            'Notion page';
 
         const walkChildren = (id, lines, seen, depth = 0) => {
             if (!id || seen.has(id) || depth > 10 || lines.join('\n').length > 65000) return;
@@ -6860,13 +7230,13 @@ ${sourcePart}
             if (String(page.type || '') !== 'page') continue;
 
             const lines = [];
-            const title = blockText(page) || 'Notion page';
+            const title = pageTitle(page);
             lines.push(`PAGE TITLE: ${title}`);
             lines.push(`PAGE ID: ${id}`);
 
             const props = page.properties || {};
             for (const [propertyId, rawValue] of Object.entries(props)) {
-                if (propertyId === 'title') continue;
+                if (propertyId === 'title' || titlePropertyIds.has(propertyId)) continue;
                 const text = cleanText(rawValue);
                 if (!text) continue;
                 const name = propertyNames.get(propertyId) || propertyId;
@@ -6878,7 +7248,7 @@ ${sourcePart}
             }
 
             const text = lines.join('\n').trim();
-            if (text.length < 20) continue;
+            if (!text) continue;
 
             const imageUrl = notionNetworkPublicImageUrl(
                 rootUrl,
@@ -6897,7 +7267,9 @@ ${sourcePart}
                 imageUrl
             });
 
-            if (pages.length >= 220) break;
+            // External libraries can legitimately contain 200+ cards.
+            // The previous 220-page hard stop silently dropped the tail.
+            if (pages.length >= 1000) break;
         }
 
         // 드물게 row block이 type=page가 아닌 응답 포맷도 있으므로,
@@ -7346,7 +7718,13 @@ ${pagePayload}
 
                 let sourceUrl = String(item?.sourceUrl || '').trim();
                 if (!knownUrls.has(sourceUrl)) {
-                    sourceUrl = fallbackPages[0]?.url || '';
+                    // With multiple rows, assigning an unknown AI URL to the
+                    // first page silently turns unrelated rows into one card.
+                    // A single-page batch is unambiguous; otherwise leave it
+                    // unresolved so the caller can match the real row title/ID.
+                    sourceUrl = fallbackPages.length === 1
+                        ? (fallbackPages[0]?.url || '')
+                        : '';
                 }
 
                 return {
@@ -7380,7 +7758,7 @@ ${pagePayload}
 
         for (const page of pages) {
             const text = String(page.text || '').trim();
-            if (text.length < 20) continue;
+            if (!text) continue;
 
             const estimated = Math.min(text.length, 60000) + 500;
             if (
@@ -7398,6 +7776,95 @@ ${pagePayload}
 
         if (batch.length) batches.push(batch);
         return batches;
+    }
+
+    function naiNotionExternalFetchPageIds(
+        expectedRowIds = [],
+        cachedPromptRowIds = [],
+        cachedNonPromptRowIds = []
+    ) {
+        const promptSet = new Set(
+            (Array.isArray(cachedPromptRowIds) ? cachedPromptRowIds : [])
+                .map(String)
+                .filter(Boolean)
+        );
+        const nonPromptSet = new Set(
+            (Array.isArray(cachedNonPromptRowIds) ? cachedNonPromptRowIds : [])
+                .map(String)
+                .filter(Boolean)
+        );
+        return (Array.isArray(expectedRowIds) ? expectedRowIds : [])
+            .map(String)
+            .filter(id => id && !promptSet.has(id) && !nonPromptSet.has(id));
+    }
+
+    function naiNotionFinalizeExternalRowVerification(
+        verification = {},
+        {
+            loadedPromptRowIds = [],
+            nonPromptRowIds = [],
+            failedRowIds = []
+        } = {}
+    ) {
+        const expectedRowIds = [
+            ...new Set(
+                (Array.isArray(verification?.expectedRowIds)
+                    ? verification.expectedRowIds
+                    : [])
+                    .map(String)
+                    .filter(Boolean)
+            )
+        ];
+        const expectedSet = new Set(expectedRowIds);
+        const inExpectedScope = id => !expectedSet.size || expectedSet.has(id);
+        const promptSet = new Set(
+            (Array.isArray(loadedPromptRowIds) ? loadedPromptRowIds : [])
+                .map(String)
+                .filter(id => id && inExpectedScope(id))
+        );
+        const nonPromptSet = new Set(
+            (Array.isArray(nonPromptRowIds) ? nonPromptRowIds : [])
+                .map(String)
+                .filter(id => id && inExpectedScope(id) && !promptSet.has(id))
+        );
+        const resolvedSet = new Set([...promptSet, ...nonPromptSet]);
+        const missingRowIds = expectedRowIds.filter(id => !resolvedSet.has(id));
+        const missingSet = new Set(missingRowIds);
+        const failureSet = new Set(
+            (Array.isArray(failedRowIds) ? failedRowIds : [])
+                .map(String)
+                .filter(id => id && missingSet.has(id))
+        );
+        for (const id of missingRowIds) failureSet.add(id);
+
+        const expectedCount = Math.max(
+            Number(verification?.expectedCount || 0),
+            expectedRowIds.length
+        );
+        const unknownMissingCount = Math.max(
+            Number(verification?.unknownMissingCount || 0),
+            expectedCount - expectedRowIds.length,
+            0
+        );
+        const missingCount = missingRowIds.length + unknownMissingCount;
+
+        return {
+            ...verification,
+            expectedCount,
+            expectedRowIds,
+            loadedPromptRowIds: [...promptSet],
+            nonPromptRowIds: [...nonPromptSet],
+            failedRowIds: [...failureSet],
+            resolvedRowIds: [...resolvedSet],
+            missingRowIds,
+            promptCount: promptSet.size,
+            nonPromptCount: nonPromptSet.size,
+            failedCount: failureSet.size + unknownMissingCount,
+            resolvedCount: resolvedSet.size,
+            missingCount,
+            verifiedLoadedCount: Math.max(0, expectedCount - missingCount),
+            complete: missingCount === 0
+        };
     }
 
 
@@ -7506,6 +7973,7 @@ ${pagePayload}
             categories,
             sourceUrl: String(page?.url || ''),
             sourcePageTitle: String(page?.title || '').trim(),
+            _notionPageId: String(page?.id || ''),
             _notionImageUrl: String(page?.imageUrl || '')
         };
     }
@@ -7577,7 +8045,29 @@ ${pagePayload}
                         collectionId: String(targetDatabase.collectionId || ''),
                         blockId: String(targetDatabase.blockId || ''),
                         viewId: String(targetDatabase.viewId || ''),
-                        spaceId: String(targetDatabase.spaceId || '')
+                        spaceId: String(targetDatabase.spaceId || ''),
+                        cachedRowIds: [
+                            ...new Set(
+                                (Array.isArray(targetDatabase.items) ? targetDatabase.items : [])
+                                    .map(item => String(
+                                        item?._notionPageId ||
+                                        notionNetworkIdsFromPublicUrl(
+                                            String(item?.source?.url || '')
+                                        ).pageId ||
+                                        ''
+                                    ))
+                                    .filter(Boolean)
+                            )
+                        ],
+                        cachedNonPromptRowIds: [
+                            ...new Set(
+                                (Array.isArray(targetDatabase.nonPromptRowIds)
+                                    ? targetDatabase.nonPromptRowIds
+                                    : [])
+                                    .map(String)
+                                    .filter(Boolean)
+                            )
+                        ]
                     }
                     : null,
             captures: [],
@@ -7633,6 +8123,11 @@ ${pagePayload}
                             current.queryCollection &&
                             typeof current.queryCollection === 'object'
                                 ? current.queryCollection
+                                : null,
+                        rowVerification:
+                            current.rowVerification &&
+                            typeof current.rowVerification === 'object'
+                                ? current.rowVerification
                                 : null,
                         message: String(current.message || '')
                     };
@@ -8321,7 +8816,29 @@ ${pagePayload}
                 collectionId: String(section?.collectionId || section?.id || ''),
                 blockId: String(section?.blockId || ''),
                 viewId: String(section?.viewId || ''),
-                spaceId: String(section?.spaceId || '')
+                spaceId: String(section?.spaceId || ''),
+                cachedRowIds: [
+                    ...new Set(
+                        (Array.isArray(section?.items) ? section.items : [])
+                            .map(item => String(
+                                item?._notionPageId ||
+                                notionNetworkIdsFromPublicUrl(
+                                    String(item?.source?.url || '')
+                                ).pageId ||
+                                ''
+                            ))
+                            .filter(Boolean)
+                    )
+                ],
+                cachedNonPromptRowIds: [
+                    ...new Set(
+                        (Array.isArray(section?.nonPromptRowIds)
+                            ? section.nonPromptRowIds
+                            : [])
+                            .map(String)
+                            .filter(Boolean)
+                    )
+                ]
             },
             captures: [],
             queryCollection: null,
@@ -8561,7 +9078,117 @@ ${pagePayload}
                     : notionNetworkBuildReadablePages(rootUrl, captures);
         }
 
+        const verification =
+            collected?.rowVerification && typeof collected.rowVerification === 'object'
+                ? collected.rowVerification
+                : null;
+        const expectedRowIdSet = new Set(
+            Array.isArray(verification?.expectedRowIds)
+                ? verification.expectedRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const loadedPromptRowIdSet = new Set(
+            Array.isArray(verification?.cachedRowIds)
+                ? verification.cachedRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const nonPromptRowIdSet = new Set(
+            Array.isArray(verification?.cachedNonPromptRowIds)
+                ? verification.cachedNonPromptRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const failedRowIdSet = new Set(
+            Array.isArray(verification?.failedRowIds)
+                ? verification.failedRowIds.map(String).filter(Boolean)
+                : []
+        );
+        const classifiedFetchedRowIds = new Set();
+        const markNonPromptRow = page => {
+            const pageId = String(page?.id || page || '').trim();
+            if (!pageId || loadedPromptRowIdSet.has(pageId)) return;
+            nonPromptRowIdSet.add(pageId);
+            failedRowIdSet.delete(pageId);
+            classifiedFetchedRowIds.add(pageId);
+            console.info('[NAIA Sync] non-prompt row', {
+                pageId,
+                title: String(page?.title || verification?.rowTitles?.[pageId] || '').trim()
+            });
+        };
+        const finalizeRowVerification = () =>
+            naiNotionFinalizeExternalRowVerification(
+                verification || {
+                    expectedCount: expectedRowIdSet.size,
+                    expectedRowIds: [...expectedRowIdSet],
+                    rowListComplete: true,
+                    unknownMissingCount: 0
+                },
+                {
+                    loadedPromptRowIds: [...loadedPromptRowIdSet],
+                    nonPromptRowIds: [...nonPromptRowIdSet],
+                    failedRowIds: [...failedRowIdSet]
+                }
+            );
+
+        // A database sync must analyze database rows only. Navigation pages,
+        // explanatory pages and diagnostic aggregate pages are not card rows.
+        if (targetDatabase && expectedRowIdSet.size) {
+            pages = pages.filter(page => expectedRowIdSet.has(String(page?.id || '')));
+        }
+
+        // The first source-level pass discovers databases/categories. It used
+        // to continue into Prompt analysis and throw when the only readable
+        // page was a navigation or "참고사항" page. Discovery is complete here;
+        // row bodies are analyzed only after a concrete database is selected.
+        if (!targetDatabase && discoveredDatabases.length) {
+            onStatus(`Notion 외부 분류 ${discoveredDatabases.length}개 확인`);
+            return {
+                pageTitle: pages[0]?.title || 'Notion',
+                concepts: [],
+                method: 'notion-network-intercept',
+                pagesVisited: 0,
+                assetsVisited: captures.length,
+                errors: 0,
+                rowVerification: verification,
+                externalDatabases: discoveredDatabases,
+                activeExternalDatabaseId: '',
+                pageAssets: []
+            };
+        }
+
         if (!pages.length) {
+            // Incremental re-sync may legitimately have nothing to parse when
+            // every current Notion row already exists in the local cache. It may
+            // also have only failed new rows; in both cases return verification
+            // metadata so the caller can preserve cache and report exact misses.
+            if (targetDatabase && verification) {
+                for (const pageId of verification.loadedFetchRowIds || []) {
+                    if (!failedRowIdSet.has(String(pageId))) {
+                        markNonPromptRow(String(pageId));
+                    }
+                }
+                const finalizedVerification = finalizeRowVerification();
+                onStatus(
+                    verification.requestedFetchCount
+                        ? `Notion 증분 동기화 · 새 본문 복원 0/${verification.requestedFetchCount} · ` +
+                          `전체 ${finalizedVerification.verifiedLoadedCount}/${finalizedVerification.expectedCount}`
+                        : `Notion 증분 동기화 · 변경 없음 · 해결 ${finalizedVerification.verifiedLoadedCount}/${finalizedVerification.expectedCount}`
+                );
+                return {
+                    pageTitle: targetDatabase?.name || 'Notion',
+                    concepts: [],
+                    method: 'notion-network-intercept',
+                    pagesVisited: 0,
+                    assetsVisited: captures.length,
+                    errors: 0,
+                    rowVerification: finalizedVerification,
+                    externalDatabases: discoveredDatabases,
+                    activeExternalDatabaseId: String(
+                        targetDatabase?.id || targetDatabase?.collectionId || ''
+                    ),
+                    pageAssets: []
+                };
+            }
+
             const queryState = collected?.queryCollection;
             const rowCount = Array.isArray(queryState?.blockIds)
                 ? queryState.blockIds.length
@@ -8580,8 +9207,18 @@ ${pagePayload}
         const remainingPages = [];
         for (const page of pages) {
             const concept = notionDirectPromptConcept(page);
-            if (concept) directConcepts.push(concept);
-            else remainingPages.push(page);
+            if (concept) {
+                directConcepts.push(concept);
+                const pageId = String(page?.id || concept?._notionPageId || '').trim();
+                if (pageId) {
+                    loadedPromptRowIdSet.add(pageId);
+                    nonPromptRowIdSet.delete(pageId);
+                    failedRowIdSet.delete(pageId);
+                    classifiedFetchedRowIds.add(pageId);
+                }
+            } else {
+                remainingPages.push(page);
+            }
         }
 
         onStatus(
@@ -8596,9 +9233,7 @@ ${pagePayload}
         // JSON document. Six pages / ~14k chars keeps both input and output bounded.
         const batches = splitRenderedNotionPagesIntoBatches(remainingPages, 14000, 6);
         if (!directConcepts.length && !batches.length) {
-            throw new Error(
-                `Notion 내부 API에서 ${pages.length}개 row/page를 복원했지만 분석할 텍스트가 없습니다.`
-            );
+            for (const page of remainingPages) markNonPromptRow(page);
         }
 
         if (batches.length) {
@@ -8608,16 +9243,34 @@ ${pagePayload}
             }
         }
 
+        const conceptIdentityKey = (concept, sourcePage = null) => {
+            const sourceUrl = String(
+                sourcePage?.url || concept?.sourceUrl || ''
+            ).trim();
+            const pageId = String(
+                sourcePage?.id ||
+                concept?._notionPageId ||
+                notionNetworkIdsFromPublicUrl(sourceUrl).pageId ||
+                ''
+            ).trim();
+            if (pageId) return `page:${pageId}`;
+            if (sourceUrl) return `url:${normalizedExternalUrl(sourceUrl)}`;
+            const fingerprint = conceptFingerprint(
+                concept?.tags,
+                concept?.negativeTags,
+                concept?.characters
+            );
+            return fingerprint ? `legacy:${fingerprint}` : '';
+        };
         const concepts = [...directConcepts];
         const conceptKeys = new Set(
-            directConcepts.map(concept =>
-                conceptFingerprint(concept.tags, concept.negativeTags, concept.characters)
-            ).filter(Boolean)
+            directConcepts.map(concept => conceptIdentityKey(concept)).filter(Boolean)
         );
         let pageTitle = pages[0]?.title || 'Notion';
         let errors = 0;
         let emptyBatches = 0;
-        let lastBatchError = '';
+        let successfulBatches = 0;
+        let lastBatchError = null;
 
         for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
@@ -8640,6 +9293,7 @@ ${pagePayload}
                     response.text,
                     batch
                 );
+                successfulBatches += 1;
 
                 if (parsed.pageTitle) pageTitle = parsed.pageTitle;
                 if (!(parsed.concepts || []).length) emptyBatches += 1;
@@ -8647,13 +9301,9 @@ ${pagePayload}
                 const pageByUrl = new Map(
                     batch.map(page => [String(page.url || ''), page])
                 );
+                const mappedPromptPageIds = new Set();
+                let hasUnmappedConcept = false;
                 for (const concept of parsed.concepts || []) {
-                    const fingerprint = conceptFingerprint(
-                        concept.tags,
-                        concept.negativeTags,
-                        concept.characters
-                    );
-                    if (!fingerprint || conceptKeys.has(fingerprint)) continue;
                     const wantedTitle = String(concept.sourcePageTitle || '').trim();
                     const wantedName = String(concept.suggestedName || '').trim();
                     const sourcePage =
@@ -8661,15 +9311,56 @@ ${pagePayload}
                         batch.find(page => wantedTitle && String(page.title || '').trim() === wantedTitle) ||
                         batch.find(page => wantedName && String(page.title || '').trim() === wantedName) ||
                         (batch.length === 1 ? batch[0] : null);
+                    // In a selected external DB, an AI result that cannot be
+                    // mapped back to an actual queryCollection row is not a
+                    // valid card candidate.
+                    if (targetDatabase && (!sourcePage?.id || !expectedRowIdSet.has(String(sourcePage.id)))) {
+                        hasUnmappedConcept = true;
+                        continue;
+                    }
+                    if (sourcePage?.id) {
+                        const mappedPageId = String(sourcePage.id);
+                        mappedPromptPageIds.add(mappedPageId);
+                        loadedPromptRowIdSet.add(mappedPageId);
+                        nonPromptRowIdSet.delete(mappedPageId);
+                        failedRowIdSet.delete(mappedPageId);
+                        classifiedFetchedRowIds.add(mappedPageId);
+                        concept._notionPageId = mappedPageId;
+                        concept.sourcePageTitle = String(sourcePage.title || '').trim();
+                        concept.sourceUrl = String(sourcePage.url || '').trim();
+                    } else {
+                        hasUnmappedConcept = true;
+                    }
                     if (sourcePage?.imageUrl) {
                         concept._notionImageUrl = String(sourcePage.imageUrl);
                     }
-                    conceptKeys.add(fingerprint);
+                    const identityKey = conceptIdentityKey(concept, sourcePage);
+                    if (!identityKey || conceptKeys.has(identityKey)) continue;
+                    conceptKeys.add(identityKey);
                     concepts.push(concept);
+                }
+
+                for (const page of batch) {
+                    const pageId = String(page?.id || '').trim();
+                    if (!pageId || mappedPromptPageIds.has(pageId)) continue;
+                    if (hasUnmappedConcept) {
+                        failedRowIdSet.add(pageId);
+                        nonPromptRowIdSet.delete(pageId);
+                        classifiedFetchedRowIds.add(pageId);
+                    } else {
+                        markNonPromptRow(page);
+                    }
                 }
             } catch (error) {
                 errors += 1;
-                lastBatchError = String(error?.message || error || '').trim();
+                lastBatchError = error;
+                for (const page of batch) {
+                    const pageId = String(page?.id || '').trim();
+                    if (!pageId) continue;
+                    failedRowIdSet.add(pageId);
+                    nonPromptRowIdSet.delete(pageId);
+                    classifiedFetchedRowIds.add(pageId);
+                }
                 console.warn(
                     `[${APP_NAME}] Notion internal batch analysis skipped`,
                     i,
@@ -8678,24 +9369,53 @@ ${pagePayload}
             }
         }
 
+        // A fetched row can be structurally empty and therefore absent from the
+        // readable-page list. The API read still succeeded, so resolve it as a
+        // non-Prompt row rather than leaving it in an endless missing loop.
+        for (const pageIdRaw of verification?.loadedFetchRowIds || []) {
+            const pageId = String(pageIdRaw || '').trim();
+            if (
+                pageId &&
+                !classifiedFetchedRowIds.has(pageId) &&
+                !failedRowIdSet.has(pageId)
+            ) {
+                markNonPromptRow(pageId);
+            }
+        }
+
+        const finalizedVerification = finalizeRowVerification();
+        let aiFailure = errors && lastBatchError
+            ? (settings.provider === 'firebase'
+                ? naiFirebaseAiFailureSummary(lastBatchError)
+                : String(lastBatchError?.message || lastBatchError || '').trim())
+            : '';
+
         if (!concepts.length) {
-            const diag = pages
-                .slice(0, 8)
-                .map(page => `${page.title || '제목없음'}(${page.text.length}자)`)
-                .join(' / ');
-
-            const aiDiag = [
-                `AI 배치 ${batches.length}개`,
-                errors ? `오류 ${errors}개` : '',
-                emptyBatches ? `빈 결과 ${emptyBatches}개` : '',
-                lastBatchError ? `마지막 오류: ${lastBatchError.slice(0, 500)}` : ''
-            ].filter(Boolean).join(' · ');
-
-            throw new Error(
-                `Notion 내부 API로 ${pages.length}개 page까지 읽었지만 Prompt 세트를 찾지 못했습니다.` +
-                (aiDiag ? `\nAI 진단: ${aiDiag}` : '') +
-                (diag ? `\n복원 진단: ${diag}` : '')
-            );
+            const aiOutcome = naiNotionClassifyAiBatchOutcome({
+                conceptCount: concepts.length,
+                batchCount: batches.length,
+                errorCount: errors,
+                successfulBatchCount: successfulBatches
+            });
+            if (aiOutcome === 'failure') {
+                aiFailure = aiFailure || '알 수 없는 AI 오류';
+                console.error(
+                    '[NAIA AI] analysis failed after Notion page restore',
+                    {
+                        pages: pages.length,
+                        batches: batches.length,
+                        errors,
+                        provider: settings.provider || 'gemini',
+                        summary: aiFailure
+                    },
+                    lastBatchError
+                );
+            } else {
+                onStatus(
+                    `Notion row/page ${pages.length}개 분석 완료 · ` +
+                    `비-Prompt ${finalizedVerification.nonPromptCount}개 제외`
+                );
+            }
         }
 
         return {
@@ -8705,6 +9425,8 @@ ${pagePayload}
             pagesVisited: pages.length,
             assetsVisited: captures.length,
             errors,
+            aiFailure,
+            rowVerification: finalizedVerification,
             externalDatabases: discoveredDatabases,
             activeExternalDatabaseId:
                 String(
@@ -8714,6 +9436,7 @@ ${pagePayload}
                     ''
                 ),
             pageAssets: pages.map(page => ({
+                id: String(page?.id || ''),
                 url: String(page?.url || ''),
                 title: String(page?.title || ''),
                 imageUrl: String(page?.imageUrl || '')
@@ -17417,6 +18140,635 @@ ${pagePayload}
             });
     }
 
+    function naiNotionExternalCanonicalPageId(item) {
+        return String(
+            item?._notionPageId ||
+            notionNetworkIdsFromPublicUrl(String(item?.source?.url || '')).pageId ||
+            ''
+        ).trim();
+    }
+
+    function naiNotionExternalScope(item, fallbackSourceId = '', fallbackDatabaseId = '') {
+        return {
+            sourceId: String(
+                item?._notionSourceId ||
+                item?._externalSourceId ||
+                fallbackSourceId ||
+                ''
+            ).trim(),
+            databaseId: String(
+                item?._notionDatabaseId ||
+                item?._externalDatabaseId ||
+                fallbackDatabaseId ||
+                ''
+            ).trim()
+        };
+    }
+
+    function naiNotionExternalCanonicalPageUrl(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        const pageId = notionNetworkIdsFromPublicUrl(raw).pageId;
+        if (pageId) return `notion-page:${pageId}`;
+        try {
+            const url = new URL(raw);
+            url.search = '';
+            url.hash = '';
+            return url.href.replace(/\/$/, '');
+        } catch (_) {
+            return raw.split(/[?#]/, 1)[0].replace(/\/$/, '');
+        }
+    }
+
+    function naiNotionExternalCanonicalKey(
+        item,
+        fallbackSourceId = '',
+        fallbackDatabaseId = ''
+    ) {
+        const { sourceId, databaseId } = naiNotionExternalScope(
+            item,
+            fallbackSourceId,
+            fallbackDatabaseId
+        );
+        const scope = `${sourceId}\u0000${databaseId}`;
+        const pageId = naiNotionExternalCanonicalPageId(item);
+        if (pageId) return `row:${scope}\u0000${pageId}`;
+        const pageUrl = naiNotionExternalCanonicalPageUrl(item?.source?.url || '');
+        return pageUrl ? `url:${scope}\u0000${pageUrl}` : '';
+    }
+
+    function naiNotionIsLegacyInvalidExternalTitle(title, item = null) {
+        const value = String(title || '').trim().replace(/\s+/g, ' ');
+        if (!value) return true;
+        if (/^(?:prompt|notion page|untitled|제목\s*없음|이름\s*없음)(?:\s*\d+)?$/i.test(value)) {
+            return true;
+        }
+
+        const prompt = String(item?.tags || '').trim().replace(/\s+/g, ' ');
+        if (
+            prompt &&
+            (
+                value === prompt ||
+                (value.length >= 48 && prompt.startsWith(value))
+            )
+        ) {
+            return true;
+        }
+
+        // A long title is not invalid by itself. Treat it as a legacy AI
+        // description only when it also has clear sentence/list structure.
+        if (
+            value.length >= 120 &&
+            (/[,.!?…;]/.test(value) || /(?:입니다|합니다|하는|있는|with|wearing|featuring)\b/i.test(value))
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    function naiNotionCanonicalizeExternalItem(raw, {
+        rowTitles = {},
+        sourceId = '',
+        databaseId = '',
+        sourceUrl = ''
+    } = {}) {
+        const item = normalizeConceptRecord(raw);
+        const pageId = naiNotionExternalCanonicalPageId(item);
+        const scope = naiNotionExternalScope(item, sourceId, databaseId);
+        const authoritative = String(pageId ? rowTitles?.[pageId] || '' : '').trim();
+        return {
+            ...item,
+            ...(pageId && scope.sourceId && scope.databaseId
+                ? { id: `external:${scope.sourceId}:${scope.databaseId}:${pageId}` }
+                : {}),
+            ...(authoritative ? { name: authoritative } : {}),
+            ...(scope.sourceId
+                ? {
+                    _notionSourceId: scope.sourceId,
+                    _externalSourceId: scope.sourceId
+                }
+                : {}),
+            ...(scope.databaseId
+                ? {
+                    _notionDatabaseId: scope.databaseId,
+                    _externalDatabaseId: scope.databaseId
+                }
+                : {}),
+            ...(sourceUrl || item?._notionSourceUrl
+                ? { _notionSourceUrl: String(sourceUrl || item._notionSourceUrl) }
+                : {}),
+            ...(pageId ? { _notionPageId: pageId } : {})
+        };
+    }
+
+    function naiNotionRepairExternalTitleMetadata(
+        list,
+        rowTitles = {},
+        debugLabel = ''
+    ) {
+        let repairedCount = 0;
+        const items = (Array.isArray(list) ? list : []).map(item => {
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            const authoritative = String(pageId ? rowTitles?.[pageId] || '' : '').trim();
+            if (!authoritative || authoritative === String(item?.name || '').trim()) {
+                return item;
+            }
+            repairedCount += 1;
+            // Metadata-only repair: do not normalize or replace any prompt,
+            // character, image, note, category or Reference field here.
+            return { ...item, name: authoritative };
+        });
+        if (repairedCount) {
+            console.info('[NAIA Sync] title metadata repaired', {
+                context: debugLabel,
+                repaired: repairedCount
+            });
+        }
+        return { items, repairedCount };
+    }
+
+    function naiNotionCurrentExternalScope(sources = null) {
+        const savedSources = Array.isArray(sources)
+            ? sources
+            : naiNotionGetExternalSources();
+        const source = savedSources.find(
+            row => String(row?.id || '') === String(naiNotionState.externalSourceId || '')
+        ) || null;
+        const databases = Array.isArray(source?.databases) ? source.databases : [];
+        const database = databases.find(
+            row => String(row?.id || '') === String(source?.selectedDatabaseId || '')
+        ) || databases[0] || null;
+        return {
+            sourceId: String(source?.id || ''),
+            databaseId: String(database?.id || ''),
+            source,
+            database
+        };
+    }
+
+    function naiNotionFindExternalItem(requestedId, {
+        sourceId = '',
+        databaseId = '',
+        sources = null,
+        warn = true
+    } = {}) {
+        const requested = String(requestedId || '').trim();
+        const savedSources = Array.isArray(sources)
+            ? sources
+            : naiNotionGetExternalSources();
+        const current = naiNotionCurrentExternalScope(savedSources);
+        const wantedSourceId = String(sourceId || current.sourceId || '').trim();
+        const source = savedSources.find(
+            row => String(row?.id || '') === wantedSourceId
+        ) || null;
+        const databases = Array.isArray(source?.databases) ? source.databases : [];
+        const wantedDatabaseId = String(
+            databaseId ||
+            (source && source === current.source ? current.databaseId : '') ||
+            source?.selectedDatabaseId ||
+            databases[0]?.id ||
+            ''
+        ).trim();
+        const database = databases.find(
+            row => String(row?.id || '') === wantedDatabaseId
+        ) || null;
+        const canonicalMatch = requested.match(/^external:([^:]*):([^:]*):(.+)$/);
+        const requestedPageId = String(canonicalMatch?.[3] || '').trim();
+
+        const findIn = (items, fallbackDatabaseId) => {
+            for (const raw of Array.isArray(items) ? items : []) {
+                const rawScope = naiNotionExternalScope(
+                    raw,
+                    wantedSourceId,
+                    fallbackDatabaseId
+                );
+                if (wantedSourceId && rawScope.sourceId && rawScope.sourceId !== wantedSourceId) {
+                    continue;
+                }
+                if (
+                    wantedDatabaseId &&
+                    rawScope.databaseId &&
+                    rawScope.databaseId !== wantedDatabaseId
+                ) {
+                    continue;
+                }
+                const item = naiNotionCanonicalizeExternalItem(raw, {
+                    sourceId: wantedSourceId,
+                    databaseId: fallbackDatabaseId,
+                    sourceUrl: source?.url || ''
+                });
+                const pageId = naiNotionExternalCanonicalPageId(item);
+                if (
+                    String(raw?.id || '') === requested ||
+                    String(item?.id || '') === requested ||
+                    (requestedPageId && pageId === requestedPageId) ||
+                    (!canonicalMatch && pageId && pageId === requested)
+                ) {
+                    return item;
+                }
+            }
+            return null;
+        };
+
+        // database.items is authoritative for DB card actions. source.items is
+        // only the selected-database compatibility mirror used by old caches.
+        let found = database
+            ? findIn(database.items, wantedDatabaseId)
+            : null;
+        if (!found && source) {
+            found = findIn(source.items, wantedDatabaseId);
+        }
+        if (found) return found;
+
+        if (warn) {
+            console.warn('[NAIA External] item lookup failed', {
+                requestedId: requested,
+                sourceId: wantedSourceId,
+                databaseId: wantedDatabaseId
+            });
+        }
+        return null;
+    }
+
+    function naiNotionExternalCanonicalImageUrl(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        try {
+            const url = new URL(raw);
+            url.search = '';
+            url.hash = '';
+            return url.href.replace(/\/$/, '');
+        } catch (_) {
+            return raw.split(/[?#]/, 1)[0];
+        }
+    }
+
+    function naiNotionExternalLegacySignature(
+        item,
+        fallbackSourceId = '',
+        fallbackDatabaseId = ''
+    ) {
+        const { sourceId, databaseId } = naiNotionExternalScope(
+            item,
+            fallbackSourceId,
+            fallbackDatabaseId
+        );
+        const scope = `${sourceId}\u0000${databaseId}`;
+        const hasPromptContent = Boolean(
+            String(item?.tags || '').trim() ||
+            String(item?.negativeTags || '').trim() ||
+            normalizeCharacterRows(item?.characters).some(character =>
+                String(character?.prompt || '').trim() ||
+                String(character?.negativePrompt || '').trim()
+            )
+        );
+        const fp = hasPromptContent
+            ? conceptFingerprint(
+                item?.tags,
+                item?.negativeTags,
+                item?.characters
+            )
+            : '';
+        const image = naiNotionExternalCanonicalImageUrl(item?._notionImageUrl || '');
+        const name = String(item?.name || '')
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, ' ');
+
+        // Strong fallback identities for old cached rows that predate stable
+        // _notionPageId storage.  Do not use name alone: different cards may
+        // legitimately share a title.
+        if (fp && image) return `fp-image:${scope}\u0000${fp}\u0000${image}`;
+        if (fp && name) return `fp-name:${scope}\u0000${fp}\u0000${name}`;
+        if (image && name) return `image-name:${scope}\u0000${image}\u0000${name}`;
+        return '';
+    }
+
+    function naiNotionDedupeExternalItems(list, {
+        expectedIds = [],
+        rowTitles = {},
+        sourceId = '',
+        databaseId = '',
+        sourceUrl = '',
+        debugLabel = ''
+    } = {}) {
+        const expectedSet = new Set(
+            Array.isArray(expectedIds) ? expectedIds.map(String).filter(Boolean) : []
+        );
+        const titles = rowTitles && typeof rowTitles === 'object' ? rowTitles : {};
+        const normalized = (Array.isArray(list) ? list : []).map(raw =>
+            naiNotionCanonicalizeExternalItem(raw, {
+                rowTitles: titles,
+                sourceId,
+                databaseId,
+                sourceUrl
+            })
+        );
+        const removedByKey = new Map();
+        const recordRemoval = key => {
+            const type = String(key || '').split(':', 1)[0] || 'legacy';
+            removedByKey.set(type, (removedByKey.get(type) || 0) + 1);
+            if (debugLabel) {
+                console.debug('[NAIA Sync] duplicate removed', {
+                    by: type,
+                    key,
+                    context: debugLabel
+                });
+            }
+        };
+
+        // Pass 1: exact row identity. This removes the common case where the
+        // same Notion row was cached more than once under different random IDs.
+        const exact = [];
+        const exactIndex = new Map();
+        const itemScore = item => {
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            return (
+                (pageId && expectedSet.has(pageId) ? 16 : 0) +
+                (pageId ? 8 : 0) +
+                (String(item?.source?.url || '').trim() ? 4 : 0) +
+                (String(item?._notionImageUrl || '').trim() ? 2 : 0) +
+                (String(item?.name || '').trim() ? 1 : 0)
+            );
+        };
+
+        for (const item of normalized) {
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            const key = naiNotionExternalCanonicalKey(item, sourceId, databaseId);
+            if (!key) {
+                exact.push(item);
+                continue;
+            }
+            if (!exactIndex.has(key)) {
+                exactIndex.set(key, exact.length);
+                exact.push(item);
+                continue;
+            }
+            const index = exactIndex.get(key);
+            if (itemScore(item) >= itemScore(exact[index])) exact[index] = item;
+            recordRemoval(key);
+        }
+
+        // Pass 2: legacy-cache cleanup. Old versions sometimes saved a card
+        // without _notionPageId and later appended the same card again. Match
+        // those by prompt+image/name. If two distinct CURRENT Notion row IDs
+        // really contain identical content, keep both; only stale/legacy copies
+        // are collapsed into the authoritative row.
+        const out = [];
+        const signatureIndexes = new Map();
+        for (const item of exact) {
+            const signature = naiNotionExternalLegacySignature(
+                item,
+                sourceId,
+                databaseId
+            );
+            if (!signature) {
+                out.push(item);
+                continue;
+            }
+
+            const candidates = signatureIndexes.get(signature) || [];
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            const pageIsCurrent = Boolean(pageId && expectedSet.has(pageId));
+            let merged = false;
+
+            for (const index of candidates) {
+                const previous = out[index];
+                const previousPageId = naiNotionExternalCanonicalPageId(previous);
+                const previousIsCurrent = Boolean(
+                    previousPageId && expectedSet.has(previousPageId)
+                );
+
+                // Two different rows confirmed by the current queryCollection
+                // are real source rows, even if their contents happen to match.
+                if (
+                    pageIsCurrent &&
+                    previousIsCurrent &&
+                    pageId !== previousPageId
+                ) continue;
+
+                if (itemScore(item) >= itemScore(previous)) out[index] = item;
+                recordRemoval(signature);
+                merged = true;
+                break;
+            }
+
+            if (!merged) {
+                const index = out.length;
+                out.push(item);
+                candidates.push(index);
+                signatureIndexes.set(signature, candidates);
+            }
+        }
+
+        if (debugLabel && normalized.length !== out.length) {
+            console.info('[NAIA Sync] duplicate cleanup', {
+                context: debugLabel,
+                removed: normalized.length - out.length,
+                by: Object.fromEntries(removedByKey)
+            });
+        }
+
+        return out;
+    }
+
+    function naiNotionMergeIncrementalExternalItems({
+        previousItems = [],
+        newItems = [],
+        expectedIds = [],
+        rowListComplete = false,
+        dedupeOptions = {}
+    } = {}) {
+        const expectedIdSet = new Set(
+            Array.isArray(expectedIds) ? expectedIds.map(String).filter(Boolean) : []
+        );
+        const previousRowIds = new Set(
+            previousItems.map(naiNotionExternalCanonicalPageId).filter(Boolean)
+        );
+        const canonicalCurrentByPageId = new Map();
+        for (const item of [...previousItems, ...newItems]) {
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            if (
+                pageId &&
+                (!expectedIdSet.size || expectedIdSet.has(pageId))
+            ) {
+                canonicalCurrentByPageId.set(pageId, item);
+            }
+        }
+        const canonicalBySignature = new Map();
+        const canonicalByFingerprint = new Map();
+        const addCandidate = (map, key, item) => {
+            if (!key) return;
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            const candidates = map.get(key) || new Map();
+            candidates.set(pageId, item);
+            map.set(key, candidates);
+        };
+        for (const item of canonicalCurrentByPageId.values()) {
+            addCandidate(
+                canonicalBySignature,
+                naiNotionExternalLegacySignature(
+                    item,
+                    dedupeOptions.sourceId,
+                    dedupeOptions.databaseId
+                ),
+                item
+            );
+            const hasPrompt = Boolean(
+                String(item?.tags || '').trim() ||
+                String(item?.negativeTags || '').trim() ||
+                normalizeCharacterRows(item?.characters).some(row =>
+                    String(row?.prompt || '').trim() ||
+                    String(row?.negativePrompt || '').trim()
+                )
+            );
+            if (hasPrompt) {
+                addCandidate(
+                    canonicalByFingerprint,
+                    conceptFingerprint(item.tags, item.negativeTags, item.characters),
+                    item
+                );
+            }
+        }
+        const newByPageId = new Map();
+        const newByUrl = new Map();
+        for (const item of newItems) {
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            const url = naiNotionExternalCanonicalPageUrl(item?.source?.url || '');
+            if (pageId) newByPageId.set(pageId, item);
+            if (url) newByUrl.set(url, item);
+        }
+
+        const used = new Set();
+        const merged = [];
+        let preservedCount = 0;
+        let removedCount = 0;
+        let addedCount = 0;
+        let refreshedCount = 0;
+        let legacyOrphansRemoved = 0;
+
+        for (const oldItem of previousItems) {
+            const oldPageId = naiNotionExternalCanonicalPageId(oldItem);
+            const oldUrl = naiNotionExternalCanonicalPageUrl(oldItem?.source?.url || '');
+
+            if (rowListComplete && !oldPageId) {
+                const signature = naiNotionExternalLegacySignature(
+                    oldItem,
+                    dedupeOptions.sourceId,
+                    dedupeOptions.databaseId
+                );
+                const signatureMatches = signature
+                    ? [...(canonicalBySignature.get(signature)?.values() || [])]
+                    : [];
+                const hasPrompt = Boolean(
+                    String(oldItem?.tags || '').trim() ||
+                    String(oldItem?.negativeTags || '').trim() ||
+                    normalizeCharacterRows(oldItem?.characters).some(row =>
+                        String(row?.prompt || '').trim() ||
+                        String(row?.negativePrompt || '').trim()
+                    )
+                );
+                const fingerprint = hasPrompt
+                    ? conceptFingerprint(
+                        oldItem?.tags,
+                        oldItem?.negativeTags,
+                        oldItem?.characters
+                    )
+                    : '';
+                const promptMatches = fingerprint
+                    ? [...(canonicalByFingerprint.get(fingerprint)?.values() || [])]
+                    : [];
+                const unnamedPromptOnly = Boolean(
+                    hasPrompt &&
+                    !String(oldItem?.name || '').trim() &&
+                    !String(oldItem?._notionImageUrl || '').trim()
+                );
+                const matched = signatureMatches.length === 1
+                    ? signatureMatches[0]
+                    : unnamedPromptOnly && promptMatches.length === 1
+                        ? promptMatches[0]
+                        : null;
+                if (matched) {
+                    legacyOrphansRemoved += 1;
+                    console.info('[NAIA Sync] legacy orphan removed', {
+                        oldId: String(oldItem?.id || ''),
+                        matchedPageId: naiNotionExternalCanonicalPageId(matched),
+                        reason: signatureMatches.length === 1
+                            ? 'strong-signature'
+                            : 'unique-prompt-fingerprint'
+                    });
+                    continue;
+                }
+            }
+
+            if (
+                rowListComplete &&
+                oldPageId &&
+                expectedIdSet.size &&
+                !expectedIdSet.has(oldPageId)
+            ) {
+                removedCount += 1;
+                continue;
+            }
+
+            const replacement =
+                (oldPageId && newByPageId.get(oldPageId)) ||
+                (oldUrl && newByUrl.get(oldUrl)) ||
+                null;
+            if (replacement) {
+                used.add(replacement);
+                refreshedCount += 1;
+                merged.push(replacement);
+            } else {
+                preservedCount += 1;
+                merged.push(oldItem);
+            }
+        }
+
+        for (const item of newItems) {
+            if (used.has(item)) continue;
+            const pageId = naiNotionExternalCanonicalPageId(item);
+            if (!pageId || !previousRowIds.has(pageId)) addedCount += 1;
+            else refreshedCount += 1;
+            merged.push(item);
+        }
+
+        const items = naiNotionDedupeExternalItems(merged, dedupeOptions);
+        return {
+            items,
+            preservedCount,
+            removedCount,
+            addedCount,
+            refreshedCount,
+            legacyOrphansRemoved,
+            duplicatesRemoved:
+                legacyOrphansRemoved + Math.max(0, merged.length - items.length)
+        };
+    }
+
+    function naiNotionExternalPreferredTitle({
+        pageId = '',
+        rowTitles = {},
+        pageAssetTitle = '',
+        cachedTitle = '',
+        cachedItem = null,
+        suggestedName = '',
+        fallbackName = ''
+    } = {}) {
+        const safeCachedTitle = naiNotionIsLegacyInvalidExternalTitle(
+            cachedTitle,
+            cachedItem
+        ) ? '' : cachedTitle;
+        return String(
+            rowTitles?.[pageId] ||
+            pageAssetTitle ||
+            safeCachedTitle ||
+            suggestedName ||
+            fallbackName ||
+            'Prompt'
+        ).trim();
+    }
+
     async function naiNotionSyncExternalSource(
         sourceId,
         databaseId = '',
@@ -17481,6 +18833,39 @@ ${pagePayload}
                 const hierarchyCategory = String(
                     targetDatabase.groupName || ''
                 ).trim();
+                const verification =
+                    result?.rowVerification && typeof result.rowVerification === 'object'
+                        ? result.rowVerification
+                        : null;
+                const rowTitles =
+                    verification?.rowTitles && typeof verification.rowTitles === 'object'
+                        ? verification.rowTitles
+                        : {};
+                const previousRawItems = Array.isArray(targetDatabase.items)
+                    ? targetDatabase.items
+                    : [];
+                const titleRepair = naiNotionRepairExternalTitleMetadata(
+                    previousRawItems,
+                    rowTitles,
+                    `${sourceId}/${requestedId}`
+                );
+                const repairedPreviousRawItems = titleRepair.items;
+                const previousItemByPageId = new Map(
+                    repairedPreviousRawItems
+                        .map(item => [
+                            naiNotionExternalCanonicalPageId(item),
+                            item
+                        ])
+                        .filter(([pageId]) => pageId)
+                );
+                const previousTitleByPageId = new Map(
+                    repairedPreviousRawItems
+                        .map(item => [
+                            naiNotionExternalCanonicalPageId(item),
+                            String(item?.name || '').trim()
+                        ])
+                        .filter(([pageId, title]) => pageId && title)
+                );
                 const pageAssets = Array.isArray(result?.pageAssets)
                     ? result.pageAssets
                     : [];
@@ -17489,33 +18874,51 @@ ${pagePayload}
                         .filter(row => row?.url)
                         .map(row => [String(row.url), row])
                 );
-                const assetByTitle = new Map(
+                const assetById = new Map(
                     pageAssets
-                        .filter(row => row?.title)
-                        .map(row => [String(row.title).trim(), row])
+                        .filter(row => row?.id)
+                        .map(row => [String(row.id), row])
                 );
 
                 const items = (result?.concepts || []).map((raw, i) => {
-                    const sourceUrl = String(
-                        raw.sourceUrl || initialSource.url || ''
+                    const rawSourceUrl = String(
+                        raw.sourceUrl || ''
                     );
-                    const sourceTitle = String(
-                        raw.sourcePageTitle ||
-                        raw.suggestedName ||
-                        raw.name ||
+                    const rawPageId = String(
+                        raw._notionPageId ||
+                        notionNetworkIdsFromPublicUrl(rawSourceUrl).pageId ||
                         ''
-                    ).trim();
+                    );
                     const asset =
-                        assetByUrl.get(sourceUrl) ||
-                        assetByTitle.get(sourceTitle) ||
+                        assetById.get(rawPageId) ||
+                        assetByUrl.get(rawSourceUrl) ||
                         null;
+                    const canonicalRowId = String(
+                        rawPageId || asset?.id || ''
+                    ).trim();
+                    const sourceUrl = String(
+                        asset?.url || rawSourceUrl || initialSource.url || ''
+                    );
+                    const notionTitle = naiNotionExternalPreferredTitle({
+                        pageId: canonicalRowId,
+                        rowTitles,
+                        pageAssetTitle: asset?.title,
+                        cachedTitle: previousTitleByPageId.get(canonicalRowId),
+                        cachedItem: previousItemByPageId.get(canonicalRowId),
+                        suggestedName: raw.suggestedName,
+                        fallbackName: raw.name || `Prompt ${i + 1}`
+                    });
 
                     return normalizeConceptRecord({
-                        id: `${sourceId}:${requestedId}:${raw.id || i}`,
-                        name:
-                            raw.suggestedName ||
-                            raw.name ||
-                            `Prompt ${i + 1}`,
+                        id: canonicalRowId
+                            ? `external:${sourceId}:${requestedId}:${canonicalRowId}`
+                            : `external:${sourceId}:${requestedId}:legacy:${simpleHash([
+                                raw.tags || '',
+                                raw.negativeTags || '',
+                                JSON.stringify(raw.characters || []),
+                                raw._notionImageUrl || raw.imageUrl || ''
+                            ].join('\u0000'))}`,
+                        name: notionTitle,
                         tags: raw.tags || '',
                         negativeTags: raw.negativeTags || '',
                         characters: raw.characters || [],
@@ -17540,6 +18943,10 @@ ${pagePayload}
                         updatedAt: now,
                         _externalSourceId: sourceId,
                         _externalDatabaseId: requestedId,
+                        _notionSourceId: sourceId,
+                        _notionDatabaseId: requestedId,
+                        _notionSourceUrl: initialSource.url,
+                        _notionPageId: canonicalRowId,
                         _notionImageUrl: String(
                             raw._notionImageUrl ||
                             raw.imageUrl ||
@@ -17549,9 +18956,169 @@ ${pagePayload}
                     });
                 });
 
-                const imageCount = items.filter(
+                const expectedIds = Array.isArray(verification?.expectedRowIds)
+                    ? verification.expectedRowIds.map(String).filter(Boolean)
+                    : [];
+                const expectedCount = Math.max(
+                    Number(verification?.expectedCount || 0),
+                    expectedIds.length
+                );
+                const expectedIdSet = new Set(expectedIds);
+                const notionPageIdOf = item => naiNotionExternalCanonicalPageId(item);
+                const dedupeOptions = {
+                    expectedIds,
+                    rowTitles,
+                    sourceId,
+                    databaseId: requestedId,
+                    sourceUrl: initialSource.url,
+                    debugLabel: `${sourceId}/${requestedId}`
+                };
+                const previousItems = naiNotionDedupeExternalItems(
+                    repairedPreviousRawItems,
+                    dedupeOptions
+                );
+                const normalizedItems = naiNotionDedupeExternalItems(
+                    items,
+                    dedupeOptions
+                );
+                const initialDuplicateCount =
+                    Math.max(0, previousRawItems.length - previousItems.length) +
+                    Math.max(0, items.length - normalizedItems.length);
+                const previousRowIds = new Set(
+                    previousItems.map(notionPageIdOf).filter(Boolean)
+                );
+                const itemRowIds = new Set(
+                    normalizedItems.map(notionPageIdOf).filter(Boolean)
+                );
+
+                // A remote row is resolved by either a cached/new Prompt card
+                // or a successful non-Prompt classification. Prompt absence is
+                // not a fetch failure and must not remain permanently missing.
+                const promptRowIds = new Set(itemRowIds);
+                for (const id of previousRowIds) {
+                    if (!expectedIds.length || expectedIdSet.has(id)) {
+                        promptRowIds.add(id);
+                    }
+                }
+                const nonPromptRowIds = new Set(
+                    (Array.isArray(verification?.nonPromptRowIds)
+                        ? verification.nonPromptRowIds
+                        : [])
+                        .map(String)
+                        .filter(id => id && (!expectedIds.length || expectedIdSet.has(id)))
+                );
+                for (const id of promptRowIds) nonPromptRowIds.delete(id);
+                const resolvedRowIds = new Set([
+                    ...promptRowIds,
+                    ...nonPromptRowIds
+                ]);
+                const parsedMissingRowIds = expectedIds.filter(
+                    id => !resolvedRowIds.has(id)
+                );
+                const unknownMissingCount = Math.max(
+                    Number(verification?.unknownMissingCount || 0),
+                    expectedCount - expectedIds.length,
+                    0
+                );
+                const finalMissingCount = verification
+                    ? parsedMissingRowIds.length + unknownMissingCount
+                    : 0;
+                const resolvedCount = expectedCount
+                    ? Math.max(0, expectedCount - finalMissingCount)
+                    : resolvedRowIds.size || items.length;
+                const promptCount = promptRowIds.size || items.length;
+                const nonPromptCount = nonPromptRowIds.size;
+                const syncComplete = !verification || finalMissingCount === 0;
+                const rowListComplete = Boolean(
+                    verification?.rowListComplete ||
+                    (verification && unknownMissingCount === 0 && expectedIds.length >= expectedCount)
+                );
+                const previousNonPromptRowIds = new Set(
+                    (Array.isArray(targetDatabase.nonPromptRowIds)
+                        ? targetDatabase.nonPromptRowIds
+                        : [])
+                        .map(String)
+                        .filter(Boolean)
+                );
+                const committedNonPromptRowIds = rowListComplete
+                    ? new Set(
+                        [...nonPromptRowIds].filter(id => expectedIdSet.has(id))
+                    )
+                    : new Set([
+                        ...previousNonPromptRowIds,
+                        ...nonPromptRowIds
+                    ]);
+                for (const id of promptRowIds) committedNonPromptRowIds.delete(id);
+
+                // Incremental commit: keep existing cards, replace only rows we
+                // actually fetched, append new rows, and remove cards deleted
+                // from Notion only when the row list itself is known complete.
+                const mergeResult = verification
+                    ? naiNotionMergeIncrementalExternalItems({
+                        previousItems,
+                        newItems: normalizedItems,
+                        expectedIds,
+                        rowListComplete,
+                        dedupeOptions
+                    })
+                    : {
+                        items: normalizedItems,
+                        preservedCount: 0,
+                        removedCount: 0,
+                        addedCount: normalizedItems.length,
+                        refreshedCount: 0,
+                        duplicatesRemoved: 0
+                    };
+                const committedItems = mergeResult.items;
+                const {
+                    preservedCount,
+                    removedCount,
+                    addedCount,
+                    refreshedCount
+                } = mergeResult;
+                const cleanedDuplicateCount =
+                    initialDuplicateCount +
+                    Number(mergeResult.duplicatesRemoved || 0);
+
+                const imageCount = committedItems.filter(
                     item => item?._notionImageUrl
                 ).length;
+                console.info(
+                    '[NAIA Sync Result]\n' +
+                    `expected: ${expectedCount || committedItems.length}\n` +
+                    `prompt cards: ${promptCount}\n` +
+                    `non-prompt: ${nonPromptCount}\n` +
+                    `missing: ${finalMissingCount}\n` +
+                    `duplicates removed: ${cleanedDuplicateCount}`
+                );
+                console.info('[NAIA Sync Classification]', {
+                    expected: expectedCount || resolvedCount,
+                    promptRows: promptCount,
+                    nonPromptRows: nonPromptCount,
+                    failedRows: Math.max(
+                        Number(verification?.failedCount || 0),
+                        parsedMissingRowIds.length
+                    ),
+                    missingRows: finalMissingCount
+                });
+                const syncStatusText = verification
+                    ? (syncComplete
+                        ? `증분 동기화 완료 · Prompt 카드 ${promptCount}개` +
+                          (nonPromptCount ? ` · 비-Prompt ${nonPromptCount}개 제외` : '') +
+                          ` · 누락 0` +
+                          ` · 기존 ${Math.max(0, preservedCount + refreshedCount)}개` +
+                          (addedCount ? ` · 신규 ${addedCount}개` : ' · 신규 없음') +
+                          (removedCount ? ` · 삭제 ${removedCount}개 반영` : '') +
+                          (cleanedDuplicateCount ? ` · 중복 ${cleanedDuplicateCount}개 정리` : '') +
+                          ` · 이미지 ${imageCount}개`
+                        : `증분 동기화 부분 완료 · Prompt 카드 ${promptCount}개` +
+                          (nonPromptCount ? ` · 비-Prompt ${nonPromptCount}개` : '') +
+                          ` · 누락 ${finalMissingCount}개` +
+                          (result?.aiFailure ? ` · ${result.aiFailure}` : '') +
+                          (preservedCount ? ` · 기존 캐시 ${preservedCount}개 유지` : '') +
+                          (addedCount ? ` · 신규 ${addedCount}개` : '') +
+                          (cleanedDuplicateCount ? ` · 중복 ${cleanedDuplicateCount}개 정리` : ''))
+                    : `동기화 완료 · ${committedItems.length}개 · 이미지 ${imageCount}개`;
 
                 const committed = naiNotionMutateExternalSource(
                     sourceId,
@@ -17569,7 +19136,8 @@ ${pagePayload}
                             return {
                                 ...db,
                                 ...targetDatabase,
-                                items,
+                                items: committedItems,
+                                nonPromptRowIds: [...committedNonPromptRowIds],
                                 lastSync: now,
                                 lastAttempt: now,
                                 lastCheckedAt: now,
@@ -17589,7 +19157,8 @@ ${pagePayload}
                         if (!found) {
                             nextDatabases.push({
                                 ...targetDatabase,
-                                items,
+                                items: committedItems,
+                                nonPromptRowIds: [...committedNonPromptRowIds],
                                 lastSync: now,
                                 lastAttempt: now,
                                 lastCheckedAt: now,
@@ -17631,8 +19200,7 @@ ${pagePayload}
                                 ? {}
                                 : {
                                     error: '',
-                                    syncStatus:
-                                        `동기화 완료 · ${items.length}개 · 이미지 ${imageCount}개`,
+                                    syncStatus: syncStatusText,
                                     syncStatusError: false
                                 })
                         };
@@ -17643,15 +19211,22 @@ ${pagePayload}
                     ok: true,
                     sourceId,
                     sectionId: requestedId,
-                    count: items.length,
+                    count: committedItems.length,
                     imageCount,
+                    expectedCount,
+                    verifiedCardCount: resolvedCount,
+                    promptCount,
+                    nonPromptCount,
+                    failedCount: Number(verification?.failedCount || 0),
+                    missingCount: finalMissingCount,
+                    complete: syncComplete,
                     source: committed
                 };
 
                 if (!options.bulk) {
                     naiNotionSetExternalSourceStatus(
                         sourceId,
-                        `동기화 완료 · ${items.length}개 · 이미지 ${imageCount}개`
+                        syncStatusText
                     );
                 }
             } else {
@@ -18427,7 +20002,12 @@ ${pagePayload}
             </div>
           </div>`;}).join('');
         const query=String(search?.value||'').trim().toLowerCase();
-        const sourceItems=activeDatabase?(Array.isArray(activeDatabase.items)?activeDatabase.items:[]):(selected?(selected.items||[]):[]);
+        const sourceItemsRaw=activeDatabase?(Array.isArray(activeDatabase.items)?activeDatabase.items:[]):(selected?(selected.items||[]):[]);
+        const sourceItems=naiNotionDedupeExternalItems(sourceItemsRaw, {
+            sourceId: String(selected?.id || ''),
+            databaseId: String(activeDatabase?.id || ''),
+            sourceUrl: String(selected?.url || '')
+        });
         const items=sourceItems.filter(item=>{
             if(naiNotionState.externalFavoritesOnly && !naiNotionIsFavorite(item)) return false;
             return !query || [item.name,item.tags,item.negativeTags,item.note].some(v=>String(v||'').toLowerCase().includes(query));
@@ -20246,12 +21826,7 @@ ${pagePayload}
                     const favoriteItem=event.target.closest('[data-nn-favorite-item]');
                     if(favoriteItem){
                         if(favoriteItem.dataset.nnFavoriteItem==='external'){
-                            const sources=naiNotionGetExternalSources();
-                            const allItems=sources.flatMap(s=>[
-                                ...(Array.isArray(s.items)?s.items:[]),
-                                ...(Array.isArray(s.databases)?s.databases.flatMap(db=>Array.isArray(db.items)?db.items:[]):[])
-                            ]);
-                            const item=allItems.find(x=>String(x.id)===String(favoriteItem.dataset.nnId));
+                            const item=naiNotionFindExternalItem(favoriteItem.dataset.nnId);
                             if(item){
                                 const active=naiNotionToggleFavorite(item);
                                 naiNotionSetLibraryStatus(active?`“${item.name}” 즐겨찾기 추가`:`“${item.name}” 즐겨찾기 해제`);
@@ -20389,10 +21964,9 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
                         else if(type==='select'){naiNotionState.externalSourceId=id;naiNotionController.renderLibraryPanel();}
                         return;
                     }
-                    const externalItems=()=>{const sources=naiNotionGetExternalSources();return sources.flatMap(s=>[...(Array.isArray(s.items)?s.items:[]),...(Array.isArray(s.databases)?s.databases.flatMap(db=>Array.isArray(db.items)?db.items:[]):[])]);};
                     const extReferenceImage=event.target.closest('[data-nn-ext-reference-image]');
                     if(extReferenceImage){
-                        const item=externalItems().find(x=>x.id===extReferenceImage.dataset.nnId);
+                        const item=naiNotionFindExternalItem(extReferenceImage.dataset.nnId);
                         if(!item)return;
                         try{
                             naiNotionSetLibraryStatus(`“${item.name}” 로컬 레퍼런스 이미지 선택 중…`);
@@ -20408,7 +21982,7 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
                     }
                     const extReferenceToggle=event.target.closest('[data-nn-ext-reference-toggle]');
                     if(extReferenceToggle){
-                        const item=externalItems().find(x=>x.id===extReferenceToggle.dataset.nnId);
+                        const item=naiNotionFindExternalItem(extReferenceToggle.dataset.nnId);
                         if(!item)return;
                         try{
                             if(extReferenceToggle.dataset.nnExtReferenceToggle==='on'){
@@ -20424,8 +21998,8 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
                         }catch(error){naiNotionSetLibraryStatus(naiNotionHumanizeError(error),true);}
                         return;
                     }
-                    const extDetail=event.target.closest('[data-nn-ext-detail]'); if(extDetail){const item=externalItems().find(x=>x.id===extDetail.dataset.nnExtDetail); if(item) naiNotionExternalDetailModal(item); return;}
-                    const extAction=event.target.closest('[data-nn-ext-action]'); if(extAction){const item=externalItems().find(x=>x.id===extAction.dataset.nnId); if(!item)return; if(extAction.dataset.nnExtAction==='copy'){const ok=await copyText(naiNotionExternalCharacterCopyText(item)); naiNotionSetLibraryStatus(ok?'Character Prompt를 복사했습니다.':'복사에 실패했습니다.',!ok);} else if(extAction.dataset.nnExtAction==='use'){const res=await naiNotionUseExternalPreset(item); if(res.cancelled)return; naiNotionSetLibraryStatus(res.ok?`“${item.name}” 적용 완료`:res.error,!res.ok);} return;}
+                    const extDetail=event.target.closest('[data-nn-ext-detail]'); if(extDetail){const item=naiNotionFindExternalItem(extDetail.dataset.nnExtDetail); if(item) naiNotionExternalDetailModal(item); return;}
+                    const extAction=event.target.closest('[data-nn-ext-action]'); if(extAction){const item=naiNotionFindExternalItem(extAction.dataset.nnId); if(!item)return; if(extAction.dataset.nnExtAction==='copy'){const ok=await copyText(naiNotionExternalCharacterCopyText(item)); naiNotionSetLibraryStatus(ok?'Character Prompt를 복사했습니다.':'복사에 실패했습니다.',!ok);} else if(extAction.dataset.nnExtAction==='use'){const res=await naiNotionUseExternalPreset(item); if(res.cancelled)return; naiNotionSetLibraryStatus(res.ok?`“${item.name}” 적용 완료`:res.error,!res.ok);} return;}
                 });
             }
         }
@@ -20539,7 +22113,7 @@ Notion 원본은 삭제되지 않습니다.`)){naiNotionSaveExternalSources(sour
       .nai-notion-db-manager-modal{width:min(680px,calc(100vw - 28px));max-height:min(760px,calc(100vh - 28px))}.nai-notion-db-manager-toolbar{align-items:center;gap:7px}.nai-notion-db-manager-list{display:flex;flex-direction:column;gap:6px;max-height:430px;overflow:auto;padding:2px 3px 2px 0}.nai-notion-db-choice{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid #343850;border-radius:8px;background:#181a2a;color:#e7e9f4;cursor:pointer;transition:border-color .15s ease,background .15s ease}.nai-notion-db-choice:hover{border-color:#68599f;background:#1d1f32}.nai-notion-db-choice>input{flex:0 0 auto;width:15px;height:15px;margin:0}.nai-notion-db-choice-main{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}.nai-notion-db-choice-main strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-db-choice-main small{font-size:10px;color:#858ba8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-db-current{flex:0 0 auto;padding:3px 6px;border-radius:999px;background:#30294a;color:#bca8ff;font-size:9px;font-weight:700}
       .nai-notion-external-db-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin:10px 0}.nai-notion-external-bulk-sync{display:flex;align-items:center;gap:8px;margin-bottom:12px}.nai-notion-external-bulk-sync .nai-notion-inline-status{font-size:10px;color:#9b9fba}.nai-notion-external-bulk-sync .nai-notion-inline-status.error{color:#ff6f7d}.nai-notion-external-db-choice small.error{color:#ff6f7d}.nai-notion-external-db-list{display:flex;flex-direction:column;gap:12px}.nai-notion-external-db-group{display:flex;flex-direction:column;gap:6px}.nai-notion-external-db-group-title{font-size:11px;font-weight:800;color:#c9c1ec;padding:0 2px}.nai-notion-external-db-group-rows{display:flex;flex-direction:column;gap:6px}.nai-notion-external-db-choice{appearance:none;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;border:1px solid #343850;border-radius:8px;background:#181a2a;color:#e7e9f4;padding:10px 11px;cursor:pointer}.nai-notion-external-db-choice:hover,.nai-notion-external-db-choice.active{border-color:#7f66d4;background:#211f37}.nai-notion-external-db-choice>span:first-child{display:flex;flex-direction:column;gap:3px;min-width:0}.nai-notion-external-db-choice strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nai-notion-external-db-choice small{font-size:10px;color:#858ba8}
 
-      .nai-notion-external-manager{display:grid;gap:8px}.nai-notion-external-source{display:flex;flex-direction:column;gap:4px;border:1px solid #353850;border-radius:7px;padding:10px}.nai-notion-external-source-top{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}.nai-notion-external-source-top>strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nai-notion-external-source-bottom{display:flex;align-items:center;gap:8px;min-height:13px;min-width:0}.nai-notion-external-meta{font-size:10px;color:#858aa6;white-space:nowrap;flex:0 0 auto}.nai-notion-external-inline-status{font-size:10px;color:#9b9fba;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.nai-notion-external-inline-status.error{color:#ff6f7d}.nai-notion-external-inline-status[hidden]{display:none!important}.nai-notion-external-actions,.nai-notion-external-bottom,.nai-notion-source-tabs{display:flex;gap:5px;flex-wrap:wrap}.nai-notion-sync-icon{min-width:34px}.nai-notion-external-use-options{display:grid;gap:8px}.nai-notion-external-use-options .nai-loader-action{height:auto;min-height:58px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;text-align:left;gap:3px;padding:10px 12px}.nai-notion-external-use-options .nai-loader-action strong{font-size:13px}.nai-notion-external-use-options .nai-loader-action span{font-size:11px;opacity:.72;font-weight:400;white-space:normal}.nai-notion-external-bottom{margin-top:4px}.nai-notion-external-gallery{margin-top:10px}.nai-notion-card-image-empty{cursor:default!important}.nai-notion-meta-row{gap:10px;flex-wrap:wrap;color:#aeb3cc;font-size:11px}
+      .nai-notion-external-manager{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;min-width:0;max-width:100%;overflow-x:hidden}.nai-notion-external-source{display:flex;flex-direction:column;gap:4px;min-width:0;max-width:100%;border:1px solid #353850;border-radius:7px;padding:10px}.nai-notion-external-source-top{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}.nai-notion-external-source-top>strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nai-notion-external-source-bottom{display:flex;align-items:center;gap:8px;min-height:13px;min-width:0}.nai-notion-external-meta{font-size:10px;color:#858aa6;white-space:nowrap;flex:0 0 auto}.nai-notion-external-inline-status{font-size:10px;color:#9b9fba;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.nai-notion-external-inline-status.error{color:#ff6f7d}.nai-notion-external-inline-status[hidden]{display:none!important}.nai-notion-external-actions,.nai-notion-external-bottom,.nai-notion-source-tabs{display:flex;gap:5px;flex-wrap:wrap}.nai-notion-sync-icon{min-width:34px}.nai-notion-external-use-options{display:grid;gap:8px}.nai-notion-external-use-options .nai-loader-action{height:auto;min-height:58px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;text-align:left;gap:3px;padding:10px 12px}.nai-notion-external-use-options .nai-loader-action strong{font-size:13px}.nai-notion-external-use-options .nai-loader-action span{font-size:11px;opacity:.72;font-weight:400;white-space:normal}.nai-notion-external-bottom{margin-top:4px}.nai-notion-external-gallery{width:100%;min-width:0;max-width:100%;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:10px}.nai-notion-external-gallery .nai-notion-card{width:auto;min-width:0;max-width:100%}.nai-notion-card-image-empty{cursor:default!important}.nai-notion-meta-row{gap:10px;flex-wrap:wrap;color:#aeb3cc;font-size:11px}
       .nai-notion-global-toast{position:fixed;left:50%;bottom:28px;z-index:1000003;transform:translate(-50%,14px);opacity:0;pointer-events:none;padding:10px 14px;border-radius:7px;background:#202234;color:#fff;border:1px solid #494d6d;box-shadow:0 12px 36px rgba(0,0,0,.45);transition:.18s ease;max-width:min(520px,calc(100vw - 28px));text-align:center}.nai-notion-global-toast.show{opacity:1;transform:translate(-50%,0)}.nai-notion-global-toast.error{border-color:#a64d59;color:#ffd4d8}
       @media(max-width:560px){.nai-notion-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.nai-notion-check-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 10px}.nai-notion-check-grid>.nai-notion-check-item{font-size:11px}.nai-notion-external-source-top{align-items:flex-start;flex-wrap:wrap}.nai-notion-external-source-bottom{flex-wrap:wrap}}@media(max-width:380px){.nai-notion-check-grid{grid-template-columns:1fr}}
     `);
